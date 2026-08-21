@@ -15,8 +15,10 @@ import {
 	type SettingItem,
 	type SettingsListTheme,
 	SettingsList,
+	Text,
 	truncateToWidth,
 	visibleWidth,
+	VStack,
 } from "@earendil-works/pi-tui";
 
 import {
@@ -53,7 +55,7 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 		// Free-text submenu for the numeric options: a single-line input that
 		// commits on Enter and cancels on Esc.
 		const numericSubmenu = (
-			_label: string,
+			label: string,
 			currentValue: string,
 			finish: (value?: string) => void,
 		): Component => {
@@ -61,7 +63,8 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 			input.setValue(currentValue);
 			input.onSubmit = (value: string) => finish(value.trim());
 			input.onEscape = () => finish();
-			return input;
+			// Show which option is being edited above the single-line input.
+			return new VStack([new Text(label), input]);
 		};
 
 		const items: SettingItem[] = [
@@ -117,11 +120,7 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 		];
 		for (const it of items) lastGood.set(it.id, it.currentValue);
 
-		const list = new SettingsList(items, items.length + 4, settingsTheme, onChange, () => done(), {
-			enableSearch: false,
-		});
-
-		function onChange(id: string, value: string): void {
+		const onChange = (id: string, value: string): void => {
 			const result = setOption(id, value);
 			if (result.ok) {
 				lastGood.set(id, value);
@@ -132,7 +131,11 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 				ctx.ui.notify(result.message, "warning");
 			}
 			tui.requestRender();
-		}
+		};
+
+		const list = new SettingsList(items, items.length + 4, settingsTheme, onChange, () => done(), {
+			enableSearch: false,
+		});
 
 		const title = theme.fg("accent", theme.bold("Prompt History · Settings"));
 		const b = (s: string) => theme.fg("border", s);

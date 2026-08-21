@@ -43,12 +43,14 @@ import {
 	CustomEditor,
 	type ExtensionAPI,
 	type ExtensionCommandContext,
+	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { parseKey } from "@earendil-works/pi-tui";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
@@ -93,6 +95,7 @@ const DEFAULT_CONFIG: Config = {
 
 let configWarning: string | null = null;
 export let config: Config = loadConfig();
+sweepStaleTmp(); // best-effort cleanup of temp files left by crashed sessions
 
 function loadConfig(): Config {
 	let rawText: string;
@@ -146,10 +149,16 @@ function saveConfig(): void {
 // Storage
 // ---------------------------------------------------------------------------
 
-/** Strip group/other bits from an existing file (one-time migration). */
+/** Strip group/other bits from an existing (regular) file (one-time migration). */
 function tightenFile(file: string): void {
 	try {
-		const st = statSync(file);
+		const st = lstatSync(file);
+		if (st.isSymbolicLink()) {
+			// A symlink at the config/history path would have chmod applied to its
+			// target. Remove it so writeAtomic recreates a safe regular file.
+			unlinkSync(file);
+			return;
+		}
 		if (st.mode & 0o077) chmodSync(file, st.mode & 0o700);
 	} catch {
 		// Missing file: nothing to do.
@@ -158,28 +167,75 @@ function tightenFile(file: string): void {
 
 function writeAtomic(file: string, content: string): void {
 	try {
+		ensurePrivateDirs();
 		mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-		// Unpredictable tmp name: no symlink-planting target, no cross-writer races.
+		// Unpredictable tmp name + O_EXCL: no symlink-planting target, no
+		// cross-writer races, and never writes through an existing path.
 		const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-		writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600 });
+		writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
 		renameSync(tmp, file);
 	} catch {
 		// Persistence is best-effort; the session keeps working in memory.
 	}
 }
 
+/** Tighten the two storage directories to 0700 (safe-direction only). */
+function ensurePrivateDirs(): void {
+	for (const dir of [dirname(CONFIG_FILE), PROJECT_HISTORY_DIR]) {
+		try {
+			const st = statSync(dir);
+			if (st.mode & 0o077) chmodSync(dir, st.mode & 0o700);
+		} catch {
+			// Directory may not exist yet; mkdirSync above creates it 0700.
+		}
+	}
+}
+
+/**
+ * Remove stale temp files left behind if a prior process crashed between the
+ * write and the rename. A tmp whose embedded pid is no longer running is orphaned.
+ */
+function sweepStaleTmp(): void {
+	for (const dir of [dirname(CONFIG_FILE), PROJECT_HISTORY_DIR]) {
+		let names: string[];
+		try {
+			names = readdirSync(dir);
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			const m = /^(.*)\.(\d+)\.[0-9a-f]+\.tmp$/.exec(name);
+			if (!m) continue;
+			const pid = Number.parseInt(m[2], 10);
+			let alive = false;
+			try {
+				process.kill(pid, 0);
+				alive = true;
+			} catch {
+				// ESRCH: not running → orphaned.
+			}
+			if (alive) continue;
+			try {
+				unlinkSync(join(dir, name));
+			} catch {
+				// Lost the race or already gone.
+			}
+		}
+	}
+}
+
 export function historyFileFor(cwd: string): string {
 	if (config.scope === "global") return GLOBAL_HISTORY_FILE;
 	const sanitized = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "root";
-	const hash = createHash("sha1").update(cwd).digest("hex").slice(0, 8);
+	const hash = createHash("sha1").update(cwd).digest("hex").slice(0, 12);
 	return join(PROJECT_HISTORY_DIR, `${sanitized.slice(0, 100)}-${hash}.json`);
 }
 
 function loadEntries(file: string): string[] {
 	try {
+		tightenFile(file); // tighten perms even for non-array / corrupt files
 		const data: unknown = JSON.parse(readFileSync(file, "utf8"));
 		if (Array.isArray(data)) {
-			tightenFile(file);
 			return data.filter((x): x is string => typeof x === "string");
 		}
 	} catch {
@@ -206,17 +262,47 @@ function isPersistable(entry: string): boolean {
  * current config, exact duplicates collapse (newest first), so entries added
  * by a concurrent pi process survive.
  */
+/** Write an in-memory list to disk, filtered by isPersistable. Used by the
+ * destructive commands that must hit disk even when recording is disabled. */
+function persistMemory(file: string, entries: string[]): void {
+	saveEntries(file, entries.filter(isPersistable).slice(0, config.maxEntries));
+}
+
+/**
+ * Merge-flush the live history into the file, honoring the dedup setting. The
+ * on-disk file is re-read and re-merged on every attempt so an entry added by a
+ * concurrent pi process is not lost (best-effort; no file lock).
+ */
 function persistEntries(file: string, live: string[]): void {
 	if (!config.enabled) return;
+	const MAX_ATTEMPTS = 3;
+	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+		const merged = mergeEntries(live, loadEntries(file));
+		saveEntries(file, merged);
+		const after = loadEntries(file);
+		const mergedSet = new Set(merged);
+		if (!after.some((e) => !mergedSet.has(e))) return;
+	}
+}
+
+/** Merge live memory with the on-disk list, honoring the dedup setting. */
+function mergeEntries(live: string[], disk: string[]): string[] {
+	const persistable = [...live.filter(isPersistable), ...disk.filter(isPersistable)];
+	if (config.dedup === "off") {
+		return persistable.slice(0, config.maxEntries); // keep all
+	}
 	const seen = new Set<string>();
 	const merged: string[] = [];
-	for (const entry of [...live.filter(isPersistable), ...loadEntries(file).filter(isPersistable)]) {
-		if (seen.has(entry)) continue;
+	for (const entry of persistable) {
+		if (config.dedup === "always" && seen.has(entry)) continue;
+		if (config.dedup === "consecutive" && merged.length > 0 && merged[merged.length - 1] === entry) {
+			continue;
+		}
 		seen.add(entry);
 		merged.push(entry);
 		if (merged.length >= config.maxEntries) break;
 	}
-	saveEntries(file, merged);
+	return merged;
 }
 
 function listHistoryFiles(): string[] {
@@ -323,15 +409,18 @@ class PersistentHistoryEditor extends CustomEditor {
 		if (!trimmed) return;
 		const h = this.memory();
 
-		// In-memory recording always happens so native ↑/↓ keeps working.
-		if (config.dedup === "consecutive" || !config.enabled) {
-			if (h[0] !== trimmed) h.unshift(trimmed);
-		} else if (config.dedup === "always") {
+		// In-memory recording always happens so native ↑/↓ keeps working;
+		// `enabled` only gates disk persistence (persistEntries early-returns),
+		// and must not change the dedup behavior chosen by the user.
+		if (config.dedup === "always") {
 			for (let i = h.length - 1; i >= 0; i--) {
 				if (h[i] === trimmed) h.splice(i, 1);
 			}
 			h.unshift(trimmed);
+		} else if (config.dedup === "consecutive") {
+			if (h[0] !== trimmed) h.unshift(trimmed);
 		} else {
+			// off: keep all
 			h.unshift(trimmed);
 		}
 
@@ -359,7 +448,8 @@ class PersistentHistoryEditor extends CustomEditor {
 /** Live editor instance, so /history can apply changes immediately. */
 export let activeEditor: PersistentHistoryEditor | null = null;
 /** Our registered factory; if another extension replaces the editor, ours is detached. */
-let myFactory: ((...args: unknown[]) => PersistentHistoryEditor) | null = null;
+type EditorFactory = Parameters<ExtensionUIContext["setEditorComponent"]>[0];
+let myFactory: EditorFactory | null = null;
 // Ctrl+R reverse-search popup state.
 let searchInputUnsub: (() => void) | null = null;
 let searchOpen = false;
@@ -395,7 +485,8 @@ export function onOff(b: boolean): string {
 
 export function statusText(cwd: string): string {
 	const file = activeEditor ? historyFileFor(activeEditor.cwd) : historyFileFor(cwd);
-	const liveCount = activeEditor ? activeEditor.memory().length : loadEntries(file).length;
+	const diskEntries = loadEntries(file);
+	const liveCount = activeEditor ? activeEditor.memory().length : diskEntries.length;
 	const lines = [
 		"Prompt history",
 		`  enabled:          ${onOff(config.enabled)}`,
@@ -406,12 +497,12 @@ export function statusText(cwd: string): string {
 		`  recordCommands:   ${onOff(config.recordCommands)} (/ and ! inputs)`,
 		`  minLength:        ${config.minLength}`,
 		`  entries (live):   ${liveCount}`,
-		`  entries (disk):   ${loadEntries(file).length}`,
+		`  entries (disk):   ${diskEntries.length}`,
 		`  file:             ${file}`,
 	];
 	if (activeEditor?.degraded) {
 		lines.push(
-			"  ⚠ native ↑/↓ browsing unavailable in this pi-tui version; persistence still active",
+			"  ! native up/down browsing unavailable in this pi-tui version; persistence still active",
 		);
 	}
 	return lines.join("\n");
@@ -456,11 +547,16 @@ function truncateLabel(entry: string): string {
 async function handleSettingsCommand(_args: string, ctx: ExtensionCommandContext): Promise<void> {
 	// If another extension replaced our editor (or the default was restored),
 	// stop mutating the detached instance.
-	if (activeEditor && myFactory && ctx.ui.getEditorComponent() !== (myFactory as unknown)) {
+	if (activeEditor && myFactory && ctx.ui.getEditorComponent() !== myFactory) {
 		activeEditor = null;
 	}
 	if (ctx.mode === "tui" && ctx.hasUI) {
-		await openConfigPanel(ctx);
+		searchOpen = true;
+		try {
+			await openConfigPanel(ctx);
+		} finally {
+			searchOpen = false;
+		}
 	} else {
 		ctx.ui.notify(statusText(ctx.cwd), "info");
 	}
@@ -469,13 +565,13 @@ async function handleSettingsCommand(_args: string, ctx: ExtensionCommandContext
 async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
 	// If another extension replaced our editor (or the default was restored),
 	// stop mutating the detached instance.
-	if (activeEditor && myFactory && ctx.ui.getEditorComponent() !== (myFactory as unknown)) {
+	if (activeEditor && myFactory && ctx.ui.getEditorComponent() !== myFactory) {
 		activeEditor = null;
 	}
 
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	const [sub, ...rest] = parts;
-	const cwd = activeEditor?.cwd ?? ctx.cwd;
+	const cwd = activeEditor?.cwd ?? ctx.cwd ?? "";
 
 	switch (sub) {
 		case undefined:
@@ -490,7 +586,12 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 				);
 				return;
 			}
-			await openSearch(ctx.ui, cwd);
+			searchOpen = true;
+			try {
+				await openSearch(ctx.ui, cwd);
+			} finally {
+				searchOpen = false;
+			}
 			return;
 
 		case "help":
@@ -577,8 +678,9 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			const kept = entries.filter((e) => !e.includes(needle));
 			const removed = entries.length - kept.length;
 			activeEditor?.setMemory(kept);
-			// Explicit destructive command: always hit disk, even when disabled.
-			saveEntries(file, kept);
+			// Explicit destructive command: always hit disk, even when disabled,
+			// and honor isPersistable so / and ! inputs never leak.
+			persistMemory(file, kept);
 			ctx.ui.notify(
 				`Removed ${removed} entr${removed === 1 ? "y" : "ies"} from memory and disk.`,
 				"info",
@@ -679,7 +781,7 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 				const h = activeEditor.memory();
 				if (h.length > n) {
 					h.length = n;
-					saveEntries(historyFileFor(activeEditor.cwd), h);
+					persistMemory(historyFileFor(activeEditor.cwd), h);
 				}
 			}
 			return { ok: true, message: `Set maxEntries = ${n}` };
@@ -701,10 +803,14 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 			config.scope = value;
 			saveConfig();
 			if (old !== value && config.enabled) {
+				// Snapshot the previous scope's history before switching files,
+				// then merge it into the new scope so nothing is lost.
+				const targetFile = historyFileFor(activeEditor?.cwd ?? "");
+				const previous = activeEditor ? activeEditor.memory() : loadEntries(targetFile);
 				activeEditor?.reloadFromDisk();
-				// Materialize the file for the new scope immediately.
-				if (activeEditor && activeEditor.memory().length > 0) {
-					persistEntries(historyFileFor(activeEditor.cwd), activeEditor.memory());
+				if (previous.length > 0) {
+					persistEntries(targetFile, previous);
+					activeEditor?.reloadFromDisk();
 				}
 			}
 			return { ok: true, message: `Set scope = ${value}` };
@@ -815,7 +921,7 @@ export default function (pi: ExtensionAPI) {
 			if (parseKey(data) === "ctrl+r") {
 				// Ctrl+R
 				searchOpen = true;
-				void openSearch(ctx.ui, ctx.cwd).finally(() => {
+				void Promise.resolve(openSearch(ctx.ui, ctx.cwd)).finally(() => {
 					searchOpen = false;
 				});
 				return { consume: true };
@@ -847,6 +953,7 @@ export default function (pi: ExtensionAPI) {
 		searchInputUnsub?.();
 		searchInputUnsub = null;
 		activeEditor = null;
+		searchOpen = false; // in case the popup was torn down without done()
 	});
 
 	pi.registerCommand("history", {

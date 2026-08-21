@@ -9,6 +9,7 @@
   "files": [
     "index.ts",
     "panel.ts",
+    "search.ts",
     "README.md"
   ],
   "pi": {

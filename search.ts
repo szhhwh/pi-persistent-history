@@ -15,7 +15,6 @@ import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent"
 import {
 	type Component,
 	type TUI,
-	getKeybindings,
 	Input,
 	parseKey,
 	truncateToWidth,
@@ -31,20 +30,29 @@ function flatten(entry: string): string {
 	return entry.replace(/\s+/g, " ");
 }
 
-/** Wrap every case-insensitive match of `q` in `fn`, leaving the rest intact. */
+/** Escape regex metacharacters so a literal query matches verbatim. */
+function escapeRegExp(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Wrap every case-insensitive match of `q` in `fn`, leaving the rest intact.
+ * Uses a regex with the `i` flag so multi-character case folds (e.g. ß→ss) are
+ * highlighted across their full extent rather than sliced by length. */
 function highlight(text: string, q: string, fn: (s: string) => string): string {
 	if (!q) return text;
-	const lower = text.toLowerCase();
-	const ql = q.toLowerCase();
+	const re = new RegExp(escapeRegExp(q), "i");
 	let out = "";
-	let i = 0;
-	let idx: number;
-	while ((idx = lower.indexOf(ql, i)) !== -1) {
-		out += text.slice(i, idx);
-		out += fn(text.slice(idx, idx + ql.length));
-		i = idx + ql.length;
+	let last = 0;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(text)) !== null) {
+		const idx = m.index;
+		const match = m[0];
+		out += text.slice(last, idx);
+		out += fn(match);
+		last = idx + match.length;
+		if (match.length === 0) re.lastIndex++; // avoid zero-width infinite loop
 	}
-	out += text.slice(i);
+	out += text.slice(last);
 	return out;
 }
 
@@ -53,9 +61,7 @@ function highlight(text: string, q: string, fn: (s: string) => string): string {
  * overlay is dismissed).
  */
 export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<void> {
-	if (!ui.custom) return;
-	await ui.custom<void>((tui: TUI, theme: Theme, _kb, done) => {
-		const kb = getKeybindings();
+	await ui.custom<void>((tui: TUI, theme: Theme, kb, done) => {
 
 		// Search scope: "project" = the current scope's history; "all" = global
 		// file + every project file, merged and de-duplicated.
