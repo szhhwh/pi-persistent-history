@@ -1,0 +1,23 @@
+{
+  "name": "pi-persistent-history",
+  "version": "1.0.0",
+  "description": "Pi extension: persist the input editor's prompt history to disk so it survives restarts, with an interactive config panel.",
+  "keywords": [
+    "pi-package"
+  ],
+  "type": "module",
+  "files": [
+    "index.ts",
+    "panel.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
