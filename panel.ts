@@ -2,9 +2,15 @@
  * Interactive configuration panel for the persistent-history extension.
  *
  * Rendered via ctx.ui.custom() as a modal overlay built on pi-tui's
- * SettingsList. Boolean/enum options cycle on Enter/Space; numeric options
- * open a single-line text-input submenu. Every accepted change is applied
- * live through setOption() (which updates the running editor and persists to
+ * SettingsList. The panel is DOCKED: anchored bottom-center directly above
+ * the input editor (fixed width, content-driven height) instead of floating
+ * in the middle of the screen. The dock offset is measured live from the
+ * TUI layout (editor block + footer) so it tracks editor growth and any
+ * extension widgets mounted below the editor.
+ *
+ * Boolean/enum options cycle on Enter/Space; numeric options open a
+ * single-line text-input submenu. Every accepted change is applied live
+ * through setOption() (which updates the running editor and persists to
  * disk), and invalid input is reverted with a warning.
  */
 
@@ -16,6 +22,7 @@ import {
 	type SettingsListTheme,
 	SettingsList,
 	Text,
+	type TUI,
 	truncateToWidth,
 	visibleWidth,
 	VStack,
@@ -29,6 +36,50 @@ import {
 	statusText,
 } from "./index";
 
+/** Fallback dock offset: empty editor (border+line+border) + one footer row. */
+const DEFAULT_DOCK_MARGIN = 4;
+
+/** Fixed panel width in columns (clamped by the TUI on narrow terminals). */
+const PANEL_WIDTH = 72;
+
+/** Whether `node` is, or contains, the live editor instance. */
+function containsEditor(node: unknown, editor: object | null, depth = 0): boolean {
+	if (node === null || node === undefined || depth > 4) return false;
+	if (node === editor) return true;
+	const kids = (node as { children?: unknown }).children;
+	if (!Array.isArray(kids)) return false;
+	return kids.some((k) => containsEditor(k, editor, depth + 1));
+}
+
+/**
+ * Rows occupied by the bottom-docked stack (the editor container through the
+ * last child: editor, widgets-below, footer). The panel's bottom margin is
+ * set to this sum, so it hugs the input box regardless of editor height.
+ * Note: widgets mounted ABOVE the editor are overlapped, not offset past —
+ * the dock hugs the editor block itself.
+ */
+export function dockedBottomMargin(tui: TUI): number {
+	try {
+		const width = Math.max(1, tui.terminal.columns);
+		const children = tui.children;
+		if (!Array.isArray(children) || children.length === 0) return DEFAULT_DOCK_MARGIN;
+		let start = children.findIndex((c) => containsEditor(c, activeEditor));
+		if (start === -1) {
+			// Editor not found (replaced?): assume the standard pi mount order,
+			// whose last four children are widgets/editor/widgets/footer.
+			start = Math.max(0, children.length - 4);
+		}
+		let margin = 0;
+		for (let i = start; i < children.length; i++) {
+			const c = children[i] as { render?: (w: number) => string[] };
+			if (typeof c?.render === "function") margin += c.render(width).length;
+		}
+		return margin > 0 ? margin : DEFAULT_DOCK_MARGIN;
+	} catch {
+		return DEFAULT_DOCK_MARGIN;
+	}
+}
+
 /**
  * Open the config panel. In non-TUI contexts (or where the custom overlay is
  * unavailable) it falls back to printing the status text.
@@ -39,7 +90,12 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 		return;
 	}
 
+	// Captured when the factory runs so overlayOptions() (invoked right after)
+	// can measure the live layout.
+	let tuiRef: TUI | null = null;
+
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+		tuiRef = tui;
 		const settingsTheme: SettingsListTheme = {
 			label: (text, selected) => (selected ? theme.fg("accent", text) : text),
 			value: (text, selected) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
@@ -175,6 +231,11 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 		};
 	}, {
 		overlay: true,
-		overlayOptions: { width: "75%", maxHeight: "85%", anchor: "center", margin: 2 },
+		overlayOptions: () => ({
+			width: PANEL_WIDTH,
+			anchor: "bottom-center",
+			margin: { bottom: tuiRef ? dockedBottomMargin(tuiRef) : DEFAULT_DOCK_MARGIN },
+			maxHeight: "85%", // safety clamp on very short terminals
+		}),
 	});
 }
