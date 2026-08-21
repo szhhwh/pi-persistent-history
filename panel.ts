@@ -15,6 +15,8 @@ import {
 	type SettingItem,
 	type SettingsListTheme,
 	SettingsList,
+	truncateToWidth,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 
 import {
@@ -133,14 +135,29 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 		}
 
 		const title = theme.fg("accent", theme.bold("Prompt History · Settings"));
+		const b = (s: string) => theme.fg("border", s);
+		// Pad a (possibly ANSI-styled) line to exactly `w` visible columns so the
+		// right border stays aligned.
+		const padLine = (line: string, w: number): string => {
+			const t = truncateToWidth(line, w, "");
+			return t + " ".repeat(Math.max(0, w - visibleWidth(t)));
+		};
 
 		return {
-			render: (w: number) => [title, "", ...list.render(w)],
+			render: (w: number) => {
+				const inner = Math.max(1, w - 2); // content width between the side borders
+				const content = [title, "", ...list.render(inner)];
+				const rule = "─".repeat(Math.max(0, w - 2));
+				const top = b(`┌${rule}┐`);
+				const bottom = b(`└${rule}┘`);
+				const body = content.map((line) => b("│") + padLine(line, inner) + b("│"));
+				return [top, ...body, bottom];
+			},
 			handleInput: (data: string) => list.handleInput(data),
 			invalidate: () => list.invalidate(),
 		};
 	}, {
 		overlay: true,
-		overlayOptions: { width: "70%", maxHeight: "85%", anchor: "center" },
+		overlayOptions: { width: "75%", maxHeight: "85%", anchor: "center", margin: 2 },
 	});
 }
