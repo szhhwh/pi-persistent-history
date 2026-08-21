@@ -8,7 +8,8 @@
  *
  * Rendered with ctx.ui.custom() as a capturing overlay, the same mechanism the
  * config panel uses. The Input box is kept focused (focused = true) so the
- * hardware cursor shows while typing.
+ * hardware cursor shows while typing. The layout is dense: title, divider,
+ * input row, divider — no padding rows around the input.
  */
 
 import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -132,7 +133,7 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 		return {
 			render: (w: number) => {
 				const inner = Math.max(1, w - 2);
-				const header = [center(title, inner), dim("─".repeat(inner)), ""];
+				const header = [center(title, inner), dim("─".repeat(inner))];
 				const searchRow = padLine(input.render(inner)[0] ?? "", inner);
 				const sep = dim("─".repeat(inner));
 
