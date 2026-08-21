@@ -136,17 +136,31 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 
 		const title = theme.fg("accent", theme.bold("Prompt History · Settings"));
 		const b = (s: string) => theme.fg("border", s);
+		const dim = (s: string) => theme.fg("dim", s);
 		// Pad a (possibly ANSI-styled) line to exactly `w` visible columns so the
 		// right border stays aligned.
 		const padLine = (line: string, w: number): string => {
 			const t = truncateToWidth(line, w, "");
 			return t + " ".repeat(Math.max(0, w - visibleWidth(t)));
 		};
+		// Center a line within `w` visible columns.
+		const center = (line: string, w: number): string => {
+			const t = truncateToWidth(line, w, "");
+			const vis = visibleWidth(t);
+			const left = Math.max(0, Math.floor((w - vis) / 2));
+			return " ".repeat(left) + t + " ".repeat(Math.max(0, w - vis - left));
+		};
 
 		return {
 			render: (w: number) => {
 				const inner = Math.max(1, w - 2); // content width between the side borders
-				const content = [title, "", ...list.render(inner)];
+				const header = [
+					"", // top breathing room
+					center(title, inner), // centered title
+					dim("─".repeat(inner)), // divider under the title
+					"", // gap before the list
+				];
+				const content = [...header, ...list.render(inner)];
 				const rule = "─".repeat(Math.max(0, w - 2));
 				const top = b(`┌${rule}┐`);
 				const bottom = b(`└${rule}┘`);
