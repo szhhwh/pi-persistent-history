@@ -117,6 +117,13 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 				currentValue: String(config.minLength),
 				submenu: (v, finish) => numericSubmenu("Min length", v, finish),
 			},
+			{
+				id: "searchRows",
+				label: "Search rows",
+				description: "Fixed height (result rows) of the search dock (1–50).",
+				currentValue: String(config.searchRows),
+				submenu: (v, finish) => numericSubmenu("Search rows", v, finish),
+			},
 		];
 		for (const it of items) lastGood.set(it.id, it.currentValue);
 

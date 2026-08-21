@@ -76,6 +76,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 | dedup | consecutive \| always \| off | consecutive | 去重策略 |
 | recordCommands | on \| off | off | 是否持久化 `/` 和 `!` 输入 |
 | minLength | 非负整数 | 0 | 短于此长度的条目不记录 |
+| searchRows | 1–50 | 10 | 搜索 dock 固定显示的结果行数（固定高度，输入时布局不跳动） |
 
 ## 持久化语义
 

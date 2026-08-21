@@ -9,18 +9,20 @@
  * and routed to the search state machine; the editor never sees them.
  *
  * Opened with Ctrl+R (wired in index.ts) or via the `/history` command.
- * Keys: type to filter · ↑↓/Ctrl+R move · Tab toggles scope · Enter fills
- * the editor · Esc (or Ctrl+C) closes.
+ * The dock has a FIXED height: the result list always renders exactly
+ * config.searchRows rows (blank-padded when fewer matches), so the layout
+ * below the dock never jumps while typing. Keys: type to filter ·
+ * ↑↓/Ctrl+R move · Tab toggles scope · Enter fills the editor · Esc (or
+ * Ctrl+C) closes.
  */
 
 import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { Input, parseKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-import { getAllHistoryEntries, getHistoryEntries } from "./index";
+import { config, getAllHistoryEntries, getHistoryEntries } from "./index";
 
 const SEARCH_WIDGET_KEY = "prompt-history-search";
-const MAX_LIST = 10;
 
 /** Collapse whitespace so multi-line prompts display on a single row. */
 function flatten(entry: string): string {
@@ -193,15 +195,18 @@ function renderDock(s: SearchSession, width: number): string[] {
 		),
 	);
 
-	// Result rows.
+	// Result rows: fixed height — exactly `rows` lines whether matched, fewer,
+	// or none, so the dock (and the editor below it) never jumps while typing.
+	const rows = Math.max(1, config.searchRows);
 	if (s.filtered.length === 0) {
 		lines.push(row(dim("(no matches)")));
+		for (let i = 1; i < rows; i++) lines.push(row(""));
 	} else {
 		const start = Math.max(
 			0,
-			Math.min(s.selected - Math.floor(MAX_LIST / 2), s.filtered.length - MAX_LIST),
+			Math.min(s.selected - Math.floor(rows / 2), s.filtered.length - rows),
 		);
-		const end = Math.min(start + MAX_LIST, s.filtered.length);
+		const end = Math.min(start + rows, s.filtered.length);
 		for (let i = start; i < end; i++) {
 			const flat = flatten(s.filtered[i]);
 			const plain = truncateToWidth(flat, inner - 4, "");
@@ -212,13 +217,14 @@ function renderDock(s: SearchSession, width: number): string[] {
 				i === s.selected ? theme.bg("selectedBg", row(content)) : row(content),
 			);
 		}
-		if (s.filtered.length > MAX_LIST) {
-			lines.push(row(dim(`${s.selected + 1}/${s.filtered.length}`)));
-		}
+		// Blank-pad to the fixed height.
+		for (let i = end - start; i < rows; i++) lines.push(row(""));
 	}
 
-	// Hint footer.
-	lines.push(row(dim("Tab: scope · ↑↓: move · Enter: use · Esc: close")));
+	// Hint footer with the position counter folded in (still exactly one row).
+	const counter =
+		s.filtered.length > rows ? `${s.selected + 1}/${s.filtered.length} · ` : "";
+	lines.push(row(dim(`${counter}Tab: scope · ↑↓: move · Enter: use · Esc: close`)));
 	return lines;
 }
 

@@ -30,6 +30,8 @@
  *   dedup          consecutive | always | off  duplicate handling (default consecutive)
  *   recordCommands on | off                 persist "/" and "!" inputs (default off)
  *   minLength      <number>                 skip entries shorter than this (default 0)
+ *   searchRows     <number>                 result rows shown in the search
+ *                                          dock, fixed height (default 10)
  *
  * Persistence semantics:
  *   - The on-disk file is re-filtered against the current config on every
@@ -81,6 +83,7 @@ interface Config {
 	dedup: "consecutive" | "always" | "off";
 	recordCommands: boolean;
 	minLength: number;
+	searchRows: number;
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -91,6 +94,7 @@ const DEFAULT_CONFIG: Config = {
 	dedup: "consecutive",
 	recordCommands: false,
 	minLength: 0,
+	searchRows: 10,
 };
 
 let configWarning: string | null = null;
@@ -137,6 +141,14 @@ function normalizeConfig(raw: unknown, previous: Config): Config {
 	if (typeof r.recordCommands === "boolean") c.recordCommands = r.recordCommands;
 	if (typeof r.minLength === "number" && Number.isInteger(r.minLength) && r.minLength >= 0) {
 		c.minLength = r.minLength;
+	}
+	if (
+		typeof r.searchRows === "number" &&
+		Number.isInteger(r.searchRows) &&
+		r.searchRows >= 1 &&
+		r.searchRows <= 50
+	) {
+		c.searchRows = r.searchRows;
 	}
 	return c;
 }
@@ -477,6 +489,7 @@ const CONFIG_KEYS: Record<string, string[]> = {
 	dedup: ["consecutive", "always", "off"],
 	recordCommands: ["on", "off"],
 	minLength: [],
+	searchRows: [],
 };
 
 export function onOff(b: boolean): string {
@@ -496,6 +509,7 @@ export function statusText(cwd: string): string {
 		`  dedup:            ${config.dedup}`,
 		`  recordCommands:   ${onOff(config.recordCommands)} (/ and ! inputs)`,
 		`  minLength:        ${config.minLength}`,
+		`  searchRows:       ${config.searchRows}`,
 		`  entries (live):   ${liveCount}`,
 		`  entries (disk):   ${diskEntries.length}`,
 		`  file:             ${file}`,
@@ -521,6 +535,7 @@ const HELP_TEXT = [
 	"                         dedup consecutive|always|off",
 	"                         recordCommands on|off",
 	"                         minLength <number>",
+	"                         searchRows <number>",
 	"  remove <substr>      delete entries containing <substr>",
 	"  clear [--all] [--yes]  wipe current scope's file (--all: every file)",
 	"  reload               reload history from disk",
@@ -837,6 +852,18 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 			config.minLength = n;
 			saveConfig();
 			return { ok: true, message: `Set minLength = ${n}` };
+		}
+		case "searchRows": {
+			const n = Number.parseInt(value, 10);
+			if (!Number.isInteger(n) || n < 1 || n > 50) {
+				return { ok: false, message: "Invalid value for searchRows: use an integer 1–50" };
+			}
+			config.searchRows = n;
+			saveConfig();
+			return {
+				ok: true,
+				message: `Set searchRows = ${n} (applies to an open search dock immediately)`,
+			};
 		}
 		default:
 			return {
