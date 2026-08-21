@@ -124,7 +124,7 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 		return {
 			render: (w: number) => {
 				const inner = Math.max(1, w - 2);
-				const header = ["", center(title, inner), dim("─".repeat(inner)), ""];
+				const header = [center(title, inner), dim("─".repeat(inner)), ""];
 				const searchRow = padLine(input.render(inner)[0] ?? "", inner);
 				const sep = dim("─".repeat(inner));
 
@@ -142,7 +142,12 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 						const plain = truncateToWidth(flat, inner - 2, "");
 						const text = highlight(plain, query, (m) => theme.fg("accent", m));
 						const prefix = i === selected ? theme.fg("accent", "→ ") : "  ";
-						listLines.push(prefix + text);
+						const line = prefix + text;
+					listLines.push(
+						i === selected
+							? theme.bg("selectedBg", padLine(line, inner))
+							: padLine(line, inner),
+					);
 					}
 					if (filtered.length > MAX_LIST) {
 						listLines.push("  " + dim(`${selected + 1}/${filtered.length}`));
@@ -154,10 +159,10 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 					searchRow,
 					sep,
 					dim(
-						`  scope: ${scope === "all" ? "all (global + projects)" : "project"}   ·   Tab 切换`,
+						`  scope: ${scope === "all" ? "all (global + projects)" : "project"}   ·   Tab toggles scope`,
 					),
 					...listLines,
-					dim("  Tab 范围 · ↑↓ 导航 · Enter 选择 · Esc 关闭"),
+					dim("  Tab: scope · ↑↓: move · Enter: use · Esc: close"),
 				];
 				const rule = "─".repeat(Math.max(0, w - 2));
 				const top = b(`┌${rule}┐`);
