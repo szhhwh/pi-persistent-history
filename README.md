@@ -26,7 +26,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 在交互模式下输入：
 
 ```
-/history
+/history-settings
 ```
 
 会打开一个**可操作的配置面板**（基于 pi 内置的 `SettingsList` 组件渲染的模态覆盖层）：
@@ -35,7 +35,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 - 数值选项（`maxEntries`、`maxEntryChars`、`minLength`）按 `Enter` 打开单行文本输入框，`Esc` 取消，非法输入会回退并提示
 - 每次修改**即时生效**并写入磁盘， Esc 关闭面板
 
-非交互模式（无 GUI）下 `/history` 会直接打印当前状态文本。
+非交互模式（无 GUI）下 `/history-settings` 会直接打印当前状态文本。
 
 ## 搜索历史（Ctrl+R）
 
@@ -49,7 +49,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 也可以用命令打开同一个弹窗：
 
 ```
-/history search
+/history
 ```
 
 ## 其他子命令
@@ -57,7 +57,6 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 ```
 /history show [n]              列出最近 n 条（默认 10）
 /history pick                  TUI 中从列表挑选一条填入编辑器
-/history search               交互式搜索历史（也可直接按 Ctrl+R）
 /history set <key> <value>     改选项（脚本/非交互用，等效面板）
 /history remove <substr>       删除包含子串的条目
 /history clear [--all] [--yes] 清空当前 scope 的文件（--all 清全部）

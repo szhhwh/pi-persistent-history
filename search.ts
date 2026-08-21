@@ -1,7 +1,7 @@
 /**
  * Reverse-i-search style prompt history search.
  *
- * Opened with Ctrl+R (wired in index.ts) or via `/history search`. Renders a
+ * Opened with Ctrl+R (wired in index.ts) or via the `/history` command. Renders a
  * small modal overlay with a live-filtering text box over the persisted prompt
  * history. The matched substring is highlighted; Up/Down (or pressing Ctrl+R
  * again) move through the hits, Enter fills the editor, Esc closes.

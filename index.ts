@@ -10,8 +10,9 @@
  *   Config:            ~/.pi/agent/prompt-history.config.json
  * Files are created 0600 (dirs 0700) and existing files are tightened on load.
  *
- * Configure with the /history command:
- *   /history                        open the interactive config panel (TUI)
+ * Configure with the /history-settings command, or search with /history:
+ *   /history-settings               open the interactive config panel (TUI)
+ *   /history                        open the reverse-i-search popup (TUI)
  *   /history show [n]               list recent n entries (default 10)
  *   /history pick                   pick an entry into the editor (TUI)
  *   /history set <key> <value>      change an option (applies live)
@@ -370,7 +371,6 @@ let searchOpen = false;
 const SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "show", label: "show", description: "List recent entries" },
 	{ value: "pick", label: "pick", description: "Pick an entry into the editor" },
-	{ value: "search", label: "search", description: "Search history (Ctrl+R)" },
 	{ value: "set", label: "set", description: "Change an option" },
 	{ value: "remove", label: "remove", description: "Delete matching entries" },
 	{ value: "clear", label: "clear", description: "Wipe stored history (--all for every file)" },
@@ -418,11 +418,10 @@ export function statusText(cwd: string): string {
 }
 
 const HELP_TEXT = [
-	"Usage: /history <subcommand>",
-	"  (none)               open the interactive config panel (TUI)",
+	"Usage: /history [subcommand]   (or /history-settings for the panel)",
+	"  (none)               open the reverse-i-search popup (TUI)",
 	"  show [n]             list recent n entries (default 10)",
 	"  pick                 pick an entry into the editor (TUI)",
-	"  search               search history interactively (also Ctrl+R)",
 	"  set <key> <val>      change an option:",
 	"                         enabled on|off",
 	"                         maxEntries <number>",
@@ -437,6 +436,7 @@ const HELP_TEXT = [
 	"  path                 show storage file location",
 	"",
 	"Notes:",
+	"- Open the interactive config panel with /history-settings.",
 	"- recordCommands=off keeps / and ! inputs out of the history file.",
 	"- The file is re-filtered and merge-flushed on every submit: config",
 	"  changes purge non-matching entries, and entries written by another pi",
@@ -446,6 +446,24 @@ const HELP_TEXT = [
 function truncateLabel(entry: string): string {
 	const oneLine = entry.replace(/\s+/g, " ");
 	return oneLine.length > 97 ? `${oneLine.slice(0, 96)}…` : oneLine;
+}
+
+/**
+ * Open the settings/config panel (the `/history-settings` command). This is
+ * the GUI surface for every option; in non-interactive mode it falls back to
+ * plain status text.
+ */
+async function handleSettingsCommand(_args: string, ctx: ExtensionCommandContext): Promise<void> {
+	// If another extension replaced our editor (or the default was restored),
+	// stop mutating the detached instance.
+	if (activeEditor && myFactory && ctx.ui.getEditorComponent() !== (myFactory as unknown)) {
+		activeEditor = null;
+	}
+	if (ctx.mode === "tui" && ctx.hasUI) {
+		await openConfigPanel(ctx);
+	} else {
+		ctx.ui.notify(statusText(ctx.cwd), "info");
+	}
 }
 
 async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
@@ -461,13 +479,18 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 
 	switch (sub) {
 		case undefined:
-			// The config command opens the interactive panel in TUI mode;
-			// fall back to plain status text where a GUI isn't available.
-			if (ctx.mode === "tui" && ctx.hasUI) {
-				await openConfigPanel(ctx);
-			} else {
-				ctx.ui.notify(statusText(cwd), "info");
+			// No argument: open the reverse-i-search popup. The settings panel now
+			// lives at /history-settings; fall back to a hint where a GUI isn't
+			// available.
+			if (ctx.mode !== "tui" || !ctx.hasUI) {
+				ctx.ui.notify(
+					"/history opens the search popup (interactive mode only). " +
+						"Use /history-settings for the config panel, or /history help.",
+					"warning",
+				);
+				return;
 			}
+			await openSearch(ctx.ui, cwd);
 			return;
 
 		case "help":
@@ -621,15 +644,6 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 					: `Reloaded ${n} entries (recording is off — new prompts are not saved).`,
 				"info",
 			);
-			return;
-		}
-
-		case "search": {
-			if (ctx.mode !== "tui" || !ctx.hasUI) {
-				ctx.ui.notify("/history search is only available in interactive mode.", "warning");
-				return;
-			}
-			await openSearch(ctx.ui, cwd);
 			return;
 		}
 
@@ -836,8 +850,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("history", {
-		description: "Configure persistent prompt history (opens a panel)",
+		description: "Search persistent prompt history (reverse-i-search popup, also Ctrl+R)",
 		getArgumentCompletions: argumentCompletions,
 		handler: handleHistoryCommand,
+	});
+
+	pi.registerCommand("history-settings", {
+		description: "Open the persistent prompt history settings panel",
+		handler: handleSettingsCommand,
 	});
 }
