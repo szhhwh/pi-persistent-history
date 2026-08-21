@@ -37,11 +37,26 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 非交互模式（无 GUI）下 `/history` 会直接打印当前状态文本。
 
+## 搜索历史（Ctrl+R）
+
+在交互模式的输入框中按 **Ctrl+R** 打开一个**独立的小弹窗**，对已有的 prompt 历史做反向增量搜索（类似 bash 的 reverse-i-search）：
+
+- 直接键入即在历史中实时过滤；命中的子串会高亮
+- ↑/↓（或再按一次 Ctrl+R）在结果间移动；最上面的框里显示当前搜索词
+- `Enter` 把选中的历史条目填入输入框，`Esc` 关闭弹窗
+
+也可以用命令打开同一个弹窗：
+
+```
+/history search
+```
+
 ## 其他子命令
 
 ```
 /history show [n]              列出最近 n 条（默认 10）
 /history pick                  TUI 中从列表挑选一条填入编辑器
+/history search               交互式搜索历史（也可直接按 Ctrl+R）
 /history set <key> <value>     改选项（脚本/非交互用，等效面板）
 /history remove <substr>       删除包含子串的条目
 /history clear [--all] [--yes] 清空当前 scope 的文件（--all 清全部）

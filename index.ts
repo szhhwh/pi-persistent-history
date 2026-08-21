@@ -44,6 +44,7 @@ import {
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { parseKey } from "@earendil-works/pi-tui";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
@@ -59,6 +60,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { openConfigPanel } from "./panel";
+import { openSearch } from "./search";
 
 const CONFIG_FILE = join(homedir(), ".pi", "agent", "prompt-history.config.json");
 const GLOBAL_HISTORY_FILE = join(homedir(), ".pi", "agent", "prompt-history.json");
@@ -239,6 +241,15 @@ function listHistoryFiles(): string[] {
 // ---------------------------------------------------------------------------
 
 /**
+ * Current history entries (live memory when available, else on-disk), newest
+ * first. Used by the search popup so it can scan both the in-memory list and
+ * the persisted file.
+ */
+export function getHistoryEntries(cwd: string): string[] {
+	return activeEditor ? activeEditor.memory() : loadEntries(historyFileFor(cwd));
+}
+
+/**
  * Replaces the stock editor to persist prompt history.
  *
  * Relies on pi-tui Editor's `history`/`historyIndex`/`historyDraft` fields
@@ -330,6 +341,9 @@ class PersistentHistoryEditor extends CustomEditor {
 export let activeEditor: PersistentHistoryEditor | null = null;
 /** Our registered factory; if another extension replaces the editor, ours is detached. */
 let myFactory: ((...args: unknown[]) => PersistentHistoryEditor) | null = null;
+// Ctrl+R reverse-search popup state.
+let searchInputUnsub: (() => void) | null = null;
+let searchOpen = false;
 
 // ---------------------------------------------------------------------------
 // /history command
@@ -338,6 +352,7 @@ let myFactory: ((...args: unknown[]) => PersistentHistoryEditor) | null = null;
 const SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "show", label: "show", description: "List recent entries" },
 	{ value: "pick", label: "pick", description: "Pick an entry into the editor" },
+	{ value: "search", label: "search", description: "Search history (Ctrl+R)" },
 	{ value: "set", label: "set", description: "Change an option" },
 	{ value: "remove", label: "remove", description: "Delete matching entries" },
 	{ value: "clear", label: "clear", description: "Wipe stored history (--all for every file)" },
@@ -389,6 +404,7 @@ const HELP_TEXT = [
 	"  (none)               open the interactive config panel (TUI)",
 	"  show [n]             list recent n entries (default 10)",
 	"  pick                 pick an entry into the editor (TUI)",
+	"  search               search history interactively (also Ctrl+R)",
 	"  set <key> <val>      change an option:",
 	"                         enabled on|off",
 	"                         maxEntries <number>",
@@ -590,6 +606,15 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			return;
 		}
 
+		case "search": {
+			if (ctx.mode !== "tui" || !ctx.hasUI) {
+				ctx.ui.notify("/history search is only available in interactive mode.", "warning");
+				return;
+			}
+			await openSearch(ctx.ui, cwd);
+			return;
+		}
+
 		default:
 			ctx.ui.notify(`Unknown subcommand "${sub}". Try /history help`, "error");
 	}
@@ -751,6 +776,19 @@ export default function (pi: ExtensionAPI) {
 			configWarning = null;
 		}
 		if (ctx.mode !== "tui") return; // Editor replacement is TUI-only
+		// (Re)bind the Ctrl+R reverse-search shortcut for this session.
+		searchInputUnsub?.();
+		searchInputUnsub = ctx.ui.onTerminalInput((data) => {
+			if (searchOpen) return; // popup is open: let it handle the keystroke
+			if (parseKey(data) === "ctrl+r") {
+				// Ctrl+R
+				searchOpen = true;
+				void openSearch(ctx.ui, ctx.cwd).finally(() => {
+					searchOpen = false;
+				});
+				return { consume: true };
+			}
+		});
 		const cwd = ctx.cwd;
 		const factory = (
 			tui: ConstructorParameters<typeof CustomEditor>[0],
@@ -774,6 +812,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		searchInputUnsub?.();
+		searchInputUnsub = null;
 		activeEditor = null;
 	});
 
