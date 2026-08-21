@@ -1,29 +1,25 @@
 /**
- * Reverse-i-search style prompt history search.
+ * Docked reverse-i-search prompt history.
  *
- * Opened with Ctrl+R (wired in index.ts) or via the `/history` command. Renders a
- * small modal overlay with a live-filtering text box over the persisted prompt
- * history. The matched substring is highlighted; Up/Down (or pressing Ctrl+R
- * again) move through the hits, Enter fills the editor, Esc closes.
+ * Rendered as an aboveEditor extension widget — the same dock style as the
+ * pi-processes dock: a full-width panel flush above the input editor with a
+ * dim "── Search prompt history ──" title bar, one space of side padding, no
+ * side borders and no bottom border, so it opens straight into the editor
+ * below. While open, raw keystrokes are intercepted via ui.onTerminalInput
+ * and routed to the search state machine; the editor never sees them.
  *
- * Rendered with ctx.ui.custom() as a capturing overlay, the same mechanism the
- * config panel uses. The Input box is kept focused (focused = true) so the
- * hardware cursor shows while typing. The layout is dense: title, divider,
- * input row, divider — no padding rows around the input.
+ * Opened with Ctrl+R (wired in index.ts) or via the `/history` command.
+ * Keys: type to filter · ↑↓/Ctrl+R move · Tab toggles scope · Enter fills
+ * the editor · Esc (or Ctrl+C) closes.
  */
 
 import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import {
-	type Component,
-	type TUI,
-	Input,
-	parseKey,
-	truncateToWidth,
-	visibleWidth,
-} from "@earendil-works/pi-tui";
+import type { TUI } from "@earendil-works/pi-tui";
+import { Input, parseKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import { getAllHistoryEntries, getHistoryEntries } from "./index";
 
+const SEARCH_WIDGET_KEY = "prompt-history-search";
 const MAX_LIST = 10;
 
 /** Collapse whitespace so multi-line prompts display on a single row. */
@@ -59,164 +55,235 @@ function highlight(text: string, q: string, fn: (s: string) => string): string {
 	return out;
 }
 
+/** Live state of an open search dock. Exactly one instance at a time. */
+interface SearchSession {
+	ui: ExtensionUIContext;
+	cwd: string;
+	tui: TUI | null;
+	theme: Theme | null;
+	input: Input;
+	scope: "project" | "all";
+	entries: string[];
+	query: string;
+	filtered: string[];
+	selected: number;
+	close: () => void;
+}
+
+let session: SearchSession | null = null;
+
+/** Load the current scope's entries, de-duplicated, newest first. */
+function loadEntries(s: SearchSession): string[] {
+	const raw = s.scope === "all" ? getAllHistoryEntries() : getHistoryEntries(s.cwd);
+	const seen = new Set<string>();
+	const list: string[] = [];
+	for (const e of raw) {
+		if (seen.has(e)) continue;
+		seen.add(e);
+		list.push(e);
+	}
+	return list;
+}
+
+function recompute(s: SearchSession): void {
+	const q = s.query.toLowerCase();
+	s.filtered = q ? s.entries.filter((e) => flatten(e).toLowerCase().includes(q)) : s.entries;
+	if (s.selected >= s.filtered.length) s.selected = Math.max(0, s.filtered.length - 1);
+}
+
+function move(s: SearchSession, dir: number): void {
+	if (s.filtered.length === 0) return;
+	s.selected = (s.selected + dir + s.filtered.length) % s.filtered.length;
+	s.tui?.requestRender();
+}
+
+function accept(s: SearchSession): void {
+	const entry = s.filtered[s.selected];
+	if (entry !== undefined) s.ui.setEditorText(entry);
+	s.close();
+}
+
+function toggleScope(s: SearchSession): void {
+	s.scope = s.scope === "project" ? "all" : "project";
+	s.entries = loadEntries(s);
+	recompute(s);
+	s.selected = 0;
+	s.tui?.requestRender();
+}
+
+/** Route one raw keystroke to the search; called only while the dock is open. */
+function handleKey(s: SearchSession, data: string): void {
+	const key = parseKey(data);
+	switch (key) {
+		case "ctrl+r": // next hit, bash-style
+			move(s, 1);
+			return;
+		case "tab":
+			toggleScope(s);
+			return;
+		case "up":
+			move(s, -1);
+			return;
+		case "down":
+			move(s, 1);
+			return;
+		case "enter":
+			accept(s);
+			return;
+		case "escape":
+		case "ctrl+c":
+			s.close();
+			return;
+	}
+	// Everything else (printable text, backspace, in-query cursor moves,
+	// paste) goes to the Input component.
+	const before = s.input.getValue();
+	s.input.handleInput(data);
+	const after = s.input.getValue();
+	if (before !== after) {
+		s.query = after;
+		recompute(s);
+		s.selected = 0;
+	}
+	s.tui?.requestRender();
+}
+
 /**
- * Open the search popup. Returns when the popup is closed (Enter, Esc, or the
- * overlay is dismissed).
+ * Render the dock in the pi-processes minimal-box style: a dim full-width
+ * title bar, body rows with one space of side padding, a full-width rule
+ * under the query row, and NO side/bottom borders — the dock opens straight
+ * into the editor below.
  */
-export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<void> {
-	await ui.custom<void>((tui: TUI, theme: Theme, kb, done) => {
+function renderDock(s: SearchSession, width: number): string[] {
+	const theme = s.theme;
+	if (!theme || width <= 0) return [];
+	const dim = (t: string) => theme.fg("dim", t);
 
-		// Search scope: "project" = the current scope's history; "all" = global
-		// file + every project file, merged and de-duplicated.
-		let scope: "project" | "all" = "project";
-		const loadEntries = (): string[] => {
-			const raw = scope === "all" ? getAllHistoryEntries() : getHistoryEntries(cwd);
-			const seen = new Set<string>();
-			const list: string[] = [];
-			for (const e of raw) {
-				if (seen.has(e)) continue;
-				seen.add(e);
-				list.push(e);
-			}
-			return list;
+	const lines: string[] = [];
+
+	// Title bar: "── Search prompt history ─────" (full width, no padding).
+	const title = s.scope === "all" ? "Search prompt history (all)" : "Search prompt history";
+	const label = `── ${title} `;
+	const labelWidth = visibleWidth(label);
+	lines.push(
+		labelWidth >= width
+			? dim("─".repeat(width))
+			: dim(label) + dim("─".repeat(width - labelWidth)),
+	);
+
+	// Body rows: one space of side padding, blank-padded to full width.
+	const inner = Math.max(0, width - 2);
+	const row = (content: string): string => {
+		const t = truncateToWidth(content, inner, "");
+		return ` ${t}${" ".repeat(Math.max(0, inner - visibleWidth(t)))} `;
+	};
+
+	// Query row (Input renders its own "> " prompt and fake cursor).
+	lines.push(row(s.input.render(inner)[0] ?? ""));
+
+	// Full-width rule between the query and the results (dock divider).
+	lines.push(dim("─".repeat(width)));
+
+	// Scope line.
+	lines.push(
+		row(
+			dim(
+				`scope: ${s.scope === "all" ? "all (global + projects)" : "project"}   ·   Tab toggles scope`,
+			),
+		),
+	);
+
+	// Result rows.
+	if (s.filtered.length === 0) {
+		lines.push(row(dim("(no matches)")));
+	} else {
+		const start = Math.max(
+			0,
+			Math.min(s.selected - Math.floor(MAX_LIST / 2), s.filtered.length - MAX_LIST),
+		);
+		const end = Math.min(start + MAX_LIST, s.filtered.length);
+		for (let i = start; i < end; i++) {
+			const flat = flatten(s.filtered[i]);
+			const plain = truncateToWidth(flat, inner - 4, "");
+			const text = highlight(plain, s.query, (m) => theme.fg("accent", m));
+			const prefix = i === s.selected ? theme.fg("accent", "→ ") : "  ";
+			const content = `${prefix}${text}`;
+			lines.push(
+				i === s.selected ? theme.bg("selectedBg", row(content)) : row(content),
+			);
+		}
+		if (s.filtered.length > MAX_LIST) {
+			lines.push(row(dim(`${s.selected + 1}/${s.filtered.length}`)));
+		}
+	}
+
+	// Hint footer.
+	lines.push(row(dim("Tab: scope · ↑↓: move · Enter: use · Esc: close")));
+	return lines;
+}
+
+/**
+ * Open the docked search above the input editor. The returned promise
+ * resolves when the search closes (Enter, Esc, Ctrl+C, or closeSearch()).
+ * A second call while open resolves immediately.
+ */
+export function openSearch(ui: ExtensionUIContext, cwd: string): Promise<void> {
+	if (session) return Promise.resolve();
+	return new Promise((resolve) => {
+		const s: SearchSession = {
+			ui,
+			cwd,
+			tui: null,
+			theme: null,
+			input: new Input(),
+			scope: "project",
+			entries: [],
+			query: "",
+			filtered: [],
+			selected: 0,
+			close: () => undefined,
 		};
-		let entries = loadEntries();
+		s.input.setValue("");
+		s.input.focused = true; // render the fake cursor in the query box
+		s.entries = loadEntries(s);
+		s.filtered = s.entries;
 
-		const input = new Input();
-		input.setValue("");
-		input.focused = true; // show the hardware cursor in the search box
-
-		let query = "";
-		let filtered: string[] = entries;
-		let selected = 0;
-
-		const recompute = () => {
-			const q = query.toLowerCase();
-			filtered = q ? entries.filter((e) => flatten(e).toLowerCase().includes(q)) : entries;
-			if (selected >= filtered.length) selected = Math.max(0, filtered.length - 1);
+		const component = {
+			render: (w: number) => renderDock(s, w),
+			invalidate: () => undefined,
 		};
-
-		const move = (dir: number) => {
-			if (filtered.length === 0) return;
-			selected = (selected + dir + filtered.length) % filtered.length;
-			tui.requestRender();
-		};
-
-		const accept = () => {
-			const entry = filtered[selected];
-			if (entry !== undefined) ui.setEditorText(entry);
-			done();
-		};
-
-		const toggleScope = () => {
-			scope = scope === "project" ? "all" : "project";
-			entries = loadEntries();
-			recompute();
-			selected = 0;
-			tui.requestRender();
-		};
-
-		const title = theme.fg("accent", theme.bold("Search prompt history"));
-		const b = (s: string) => theme.fg("border", s);
-		const dim = (s: string) => theme.fg("dim", s);
-		const padLine = (line: string, w: number): string => {
-			const t = truncateToWidth(line, w, "");
-			return t + " ".repeat(Math.max(0, w - visibleWidth(t)));
-		};
-		const center = (line: string, w: number): string => {
-			const t = truncateToWidth(line, w, "");
-			const vis = visibleWidth(t);
-			const left = Math.max(0, Math.floor((w - vis) / 2));
-			return " ".repeat(left) + t + " ".repeat(Math.max(0, w - vis - left));
-		};
-
-		return {
-			render: (w: number) => {
-				const inner = Math.max(1, w - 2);
-				const header = [center(title, inner), dim("─".repeat(inner))];
-				const searchRow = padLine(input.render(inner)[0] ?? "", inner);
-				const sep = dim("─".repeat(inner));
-
-				const listLines: string[] = [];
-				if (filtered.length === 0) {
-					listLines.push("  " + dim("(no matches)"));
-				} else {
-					const start = Math.max(
-						0,
-						Math.min(selected - Math.floor(MAX_LIST / 2), filtered.length - MAX_LIST),
-					);
-					const end = Math.min(start + MAX_LIST, filtered.length);
-					for (let i = start; i < end; i++) {
-						const flat = flatten(filtered[i]);
-						const plain = truncateToWidth(flat, inner - 2, "");
-						const text = highlight(plain, query, (m) => theme.fg("accent", m));
-						const prefix = i === selected ? theme.fg("accent", "→ ") : "  ";
-						const line = prefix + text;
-					listLines.push(
-						i === selected
-							? theme.bg("selectedBg", padLine(line, inner))
-							: padLine(line, inner),
-					);
-					}
-					if (filtered.length > MAX_LIST) {
-						listLines.push("  " + dim(`${selected + 1}/${filtered.length}`));
-					}
-				}
-
-				const content = [
-					...header,
-					searchRow,
-					sep,
-					dim(
-						`  scope: ${scope === "all" ? "all (global + projects)" : "project"}   ·   Tab toggles scope`,
-					),
-					...listLines,
-					dim("  Tab: scope · ↑↓: move · Enter: use · Esc: close"),
-				];
-				const rule = "─".repeat(Math.max(0, w - 2));
-				const top = b(`┌${rule}┐`);
-				const bottom = b(`└${rule}┘`);
-				return [top, ...content.map((line) => b("│") + padLine(line, inner) + b("│")), bottom];
+		// The factory runs synchronously inside setWidget, so tui/theme are
+		// captured before the first render.
+		ui.setWidget(
+			SEARCH_WIDGET_KEY,
+			(tui: TUI, theme: Theme) => {
+				s.tui = tui;
+				s.theme = theme;
+				return component;
 			},
-			handleInput: (data: string) => {
-				if (parseKey(data) === "ctrl+r") {
-					move(1); // Ctrl+R again jumps to the next hit (bash-style)
-					return;
-				}
-				if (parseKey(data) === "tab") {
-					toggleScope();
-					return;
-				}
-				if (kb.matches(data, "tui.select.up")) {
-					move(-1);
-					return;
-				}
-				if (kb.matches(data, "tui.select.down")) {
-					move(1);
-					return;
-				}
-				if (kb.matches(data, "tui.select.confirm")) {
-					accept();
-					return;
-				}
-				if (kb.matches(data, "tui.select.cancel")) {
-					done();
-					return;
-				}
-				const before = input.getValue();
-				input.handleInput(data);
-				const after = input.getValue();
-				if (before !== after) {
-					query = after;
-					recompute();
-					selected = 0;
-				}
-				tui.requestRender();
-			},
-			invalidate: () => input.invalidate(),
+			{ placement: "aboveEditor" },
+		);
+
+		const unsubscribe = ui.onTerminalInput((data) => {
+			if (!session) return;
+			handleKey(session, data);
+			return { consume: true };
+		});
+
+		s.close = () => {
+			if (session !== s) return;
+			session = null;
+			unsubscribe();
+			ui.setWidget(SEARCH_WIDGET_KEY, undefined, { placement: "aboveEditor" });
+			resolve();
 		};
-	}, {
-		overlay: true,
-		overlayOptions: { width: "65%", maxHeight: "85%", anchor: "center", margin: 2 },
+
+		session = s;
+		s.tui?.requestRender();
 	});
+}
+
+/** Force-close an open search (e.g. session shutdown / extension teardown). */
+export function closeSearch(): void {
+	session?.close();
 }

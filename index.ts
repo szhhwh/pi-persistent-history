@@ -12,7 +12,7 @@
  *
  * Configure with the /history-settings command, or search with /history:
  *   /history-settings               open the interactive config panel (TUI)
- *   /history                        open the reverse-i-search popup (TUI)
+ *   /history                        open the docked reverse-i-search above the editor (TUI)
  *   /history show [n]               list recent n entries (default 10)
  *   /history pick                   pick an entry into the editor (TUI)
  *   /history set <key> <value>      change an option (applies live)
@@ -63,7 +63,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { openConfigPanel } from "./panel";
-import { openSearch } from "./search";
+import { closeSearch, openSearch } from "./search";
 
 const CONFIG_FILE = join(homedir(), ".pi", "agent", "prompt-history.config.json");
 const GLOBAL_HISTORY_FILE = join(homedir(), ".pi", "agent", "prompt-history.json");
@@ -329,7 +329,7 @@ function listHistoryFiles(): string[] {
 
 /**
  * Current history entries (live memory when available, else on-disk), newest
- * first. Used by the search popup so it can scan both the in-memory list and
+ * first. Used by the search dock so it can scan both the in-memory list and
  * the persisted file.
  */
 export function getHistoryEntries(cwd: string): string[] {
@@ -338,7 +338,7 @@ export function getHistoryEntries(cwd: string): string[] {
 
 /**
  * All history entries across every scope (global file + all project files),
- * merged and de-duplicated, newest occurrence kept. Used by the search popup's
+ * merged and de-duplicated, newest occurrence kept. Used by the search dock's
  * "all" mode so a query can span global and per-project histories at once.
  */
 export function getAllHistoryEntries(): string[] {
@@ -450,7 +450,7 @@ export let activeEditor: PersistentHistoryEditor | null = null;
 /** Our registered factory; if another extension replaces the editor, ours is detached. */
 type EditorFactory = Parameters<ExtensionUIContext["setEditorComponent"]>[0];
 let myFactory: EditorFactory | null = null;
-// Ctrl+R reverse-search popup state.
+// Ctrl+R reverse-search dock state.
 let searchInputUnsub: (() => void) | null = null;
 let searchOpen = false;
 
@@ -510,7 +510,7 @@ export function statusText(cwd: string): string {
 
 const HELP_TEXT = [
 	"Usage: /history [subcommand]   (or /history-settings for the panel)",
-	"  (none)               open the reverse-i-search popup (TUI)",
+	"  (none)               open the docked reverse-i-search above the editor (TUI)",
 	"  show [n]             list recent n entries (default 10)",
 	"  pick                 pick an entry into the editor (TUI)",
 	"  set <key> <val>      change an option:",
@@ -575,12 +575,12 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 
 	switch (sub) {
 		case undefined:
-			// No argument: open the reverse-i-search popup. The settings panel now
+			// No argument: open the reverse-i-search dock. The settings panel now
 			// lives at /history-settings; fall back to a hint where a GUI isn't
 			// available.
 			if (ctx.mode !== "tui" || !ctx.hasUI) {
 				ctx.ui.notify(
-					"/history opens the search popup (interactive mode only). " +
+					"/history opens the search dock (interactive mode only). " +
 						"Use /history-settings for the config panel, or /history help.",
 					"warning",
 				);
@@ -856,7 +856,7 @@ function parseBool(value: string): boolean | undefined {
  * pi-tui passes the ENTIRE text after "/history " as the prefix and replaces
  * it with item.value on completion, so values must be full argument-text
  * replacements (e.g. "set dedup"), with labels showing just the new token.
- * Returning null hides the popup, which we do on an exact unique match so
+ * Returning null hides the completion popup, which we do on an exact unique match so
  * Enter submits instead of re-applying the completion.
  */
 function argumentCompletions(prefix: string): AutocompleteItem[] | null {
@@ -917,7 +917,7 @@ export default function (pi: ExtensionAPI) {
 		// (Re)bind the Ctrl+R reverse-search shortcut for this session.
 		searchInputUnsub?.();
 		searchInputUnsub = ctx.ui.onTerminalInput((data) => {
-			if (searchOpen) return; // popup is open: let it handle the keystroke
+			if (searchOpen) return; // search dock is open: its own listener handles the keystroke
 			if (parseKey(data) === "ctrl+r") {
 				// Ctrl+R
 				searchOpen = true;
@@ -952,12 +952,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		searchInputUnsub?.();
 		searchInputUnsub = null;
+		closeSearch(); // force-close the dock and drop the widget
 		activeEditor = null;
-		searchOpen = false; // in case the popup was torn down without done()
+		searchOpen = false; // in case the dock was torn down without close()
 	});
 
 	pi.registerCommand("history", {
-		description: "Search persistent prompt history (reverse-i-search popup, also Ctrl+R)",
+		description: "Search persistent prompt history (reverse-i-search dock, also Ctrl+R)",
 		getArgumentCompletions: argumentCompletions,
 		handler: handleHistoryCommand,
 	});
