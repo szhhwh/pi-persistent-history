@@ -36,11 +36,13 @@ function escapeRegExp(s: string): string {
 }
 
 /** Wrap every case-insensitive match of `q` in `fn`, leaving the rest intact.
- * Uses a regex with the `i` flag so multi-character case folds (e.g. ß→ss) are
- * highlighted across their full extent rather than sliced by length. */
+ * Uses a regex with the `gi` flags (global is required: exec() must advance
+ * lastIndex or the loop below never terminates — an infinite loop that froze
+ * the TUI) so multi-character case folds (e.g. ß→ss) are highlighted across
+ * their full extent rather than sliced by length. */
 function highlight(text: string, q: string, fn: (s: string) => string): string {
 	if (!q) return text;
-	const re = new RegExp(escapeRegExp(q), "i");
+	const re = new RegExp(escapeRegExp(q), "gi");
 	let out = "";
 	let last = 0;
 	let m: RegExpExecArray | null;
