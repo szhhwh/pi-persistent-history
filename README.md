@@ -43,6 +43,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 - 直接键入即在历史中实时过滤；命中的子串会高亮
 - ↑/↓（或再按一次 Ctrl+R）在结果间移动；最上面的框里显示当前搜索词
+- 按 **Tab** 在 `project`（当前 scope）与 `all`（全局文件 + 所有项目文件合并去重）两种搜索范围间切换
 - `Enter` 把选中的历史条目填入输入框，`Esc` 关闭弹窗
 
 也可以用命令打开同一个弹窗：

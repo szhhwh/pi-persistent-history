@@ -250,6 +250,24 @@ export function getHistoryEntries(cwd: string): string[] {
 }
 
 /**
+ * All history entries across every scope (global file + all project files),
+ * merged and de-duplicated, newest occurrence kept. Used by the search popup's
+ * "all" mode so a query can span global and per-project histories at once.
+ */
+export function getAllHistoryEntries(): string[] {
+	const merged: string[] = [];
+	const seen = new Set<string>();
+	for (const file of listHistoryFiles()) {
+		for (const entry of loadEntries(file)) {
+			if (seen.has(entry)) continue;
+			seen.add(entry);
+			merged.push(entry);
+		}
+	}
+	return merged;
+}
+
+/**
  * Replaces the stock editor to persist prompt history.
  *
  * Relies on pi-tui Editor's `history`/`historyIndex`/`historyDraft` fields

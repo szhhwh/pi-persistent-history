@@ -22,7 +22,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 
-import { getHistoryEntries } from "./index";
+import { getAllHistoryEntries, getHistoryEntries } from "./index";
 
 const MAX_LIST = 10;
 
@@ -57,14 +57,21 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 	await ui.custom<void>((tui: TUI, theme: Theme, _kb, done) => {
 		const kb = getKeybindings();
 
-		// Newest-first, de-duplicated for display (keeps the most recent copy).
-		const seen = new Set<string>();
-		const entries: string[] = [];
-		for (const e of getHistoryEntries(cwd)) {
-			if (seen.has(e)) continue;
-			seen.add(e);
-			entries.push(e);
-		}
+		// Search scope: "project" = the current scope's history; "all" = global
+		// file + every project file, merged and de-duplicated.
+		let scope: "project" | "all" = "project";
+		const loadEntries = (): string[] => {
+			const raw = scope === "all" ? getAllHistoryEntries() : getHistoryEntries(cwd);
+			const seen = new Set<string>();
+			const list: string[] = [];
+			for (const e of raw) {
+				if (seen.has(e)) continue;
+				seen.add(e);
+				list.push(e);
+			}
+			return list;
+		};
+		let entries = loadEntries();
 
 		const input = new Input();
 		input.setValue("");
@@ -90,6 +97,14 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 			const entry = filtered[selected];
 			if (entry !== undefined) ui.setEditorText(entry);
 			done();
+		};
+
+		const toggleScope = () => {
+			scope = scope === "project" ? "all" : "project";
+			entries = loadEntries();
+			recompute();
+			selected = 0;
+			tui.requestRender();
 		};
 
 		const title = theme.fg("accent", theme.bold("Search prompt history"));
@@ -134,7 +149,16 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 					}
 				}
 
-				const content = [...header, searchRow, sep, "", ...listLines];
+				const content = [
+					...header,
+					searchRow,
+					sep,
+					dim(
+						`  scope: ${scope === "all" ? "all (global + projects)" : "project"}   ·   Tab 切换`,
+					),
+					...listLines,
+					dim("  Tab 范围 · ↑↓ 导航 · Enter 选择 · Esc 关闭"),
+				];
 				const rule = "─".repeat(Math.max(0, w - 2));
 				const top = b(`┌${rule}┐`);
 				const bottom = b(`└${rule}┘`);
@@ -143,6 +167,10 @@ export async function openSearch(ui: ExtensionUIContext, cwd: string): Promise<v
 			handleInput: (data: string) => {
 				if (parseKey(data) === "ctrl+r") {
 					move(1); // Ctrl+R again jumps to the next hit (bash-style)
+					return;
+				}
+				if (parseKey(data) === "tab") {
+					toggleScope();
 					return;
 				}
 				if (kb.matches(data, "tui.select.up")) {
