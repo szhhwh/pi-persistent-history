@@ -297,15 +297,27 @@ export function openSearch(ui: ExtensionUIContext, cwd: string): Promise<void> {
 				cwd,
 				tui,
 				theme,
-				onSelect: (entry) => close(entry),
+				onSelect: (entry) => {
+					// Order matters. pi's close() synchronously restores the editor's
+					// pre-open text (savedText) and focus, and the Enter keystroke that
+					// led here schedules an immediate repaint via process.nextTick.
+					// Setting the chosen entry must therefore happen synchronously
+					// AFTER close(), so that very frame already paints the entry.
+					// Doing it in a .then() on the ui.custom() promise is too late:
+					// showExtensionCustom is async, so the promise resolution lags the
+					// repaint by two microtask hops, and setText() itself requests no
+					// render — the first Ctrl+R run painted a stale (empty) editor and
+					// the entry only appeared after the next unrelated repaint.
+					close(entry);
+					if (typeof entry === "string") ui.setEditorText(entry);
+				},
 			});
 			currentClose = close;
 			return dock;
 		})
-		.then((entry) => {
-			// ui.custom's close restores the editor to its pre-open text first;
-			// only then do we fill it with the chosen entry (if any).
-			if (typeof entry === "string") ui.setEditorText(entry);
+		.then(() => {
+			// The chosen entry (if any) was already applied synchronously in
+			// onSelect above; nothing to do when the promise settles.
 		})
 		.finally(() => {
 			currentClose = null;
