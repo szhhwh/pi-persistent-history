@@ -39,6 +39,13 @@
  *     non-matching entries on the next submit.
  *   - Writes merge with the on-disk file (exact duplicates collapse,
  *     newest first), so entries added by another pi process survive.
+ *   - The read-merge-rewrite critical section is guarded by a per-file lock
+ *     (O_EXCL lock file + stale-pid + age probe) so concurrent pi processes
+ *     cannot lose each other's entries (TOCTOU). Assumes ~/.pi lives on a local
+ *     POSIX fs — the same assumption writeAtomic's rename already makes;
+ *     on a non-local fs the lock degrades to today's best-effort behavior.
+ *     Wedged locks (crashed/hung owner, PID reuse) are auto-reclaimed once
+ *     older than the staleness threshold — no manual intervention needed.
  */
 
 import {
@@ -100,6 +107,7 @@ const DEFAULT_CONFIG: Config = {
 let configWarning: string | null = null;
 export let config: Config = loadConfig();
 sweepStaleTmp(); // best-effort cleanup of temp files left by crashed sessions
+sweepStaleLocks(); // reclaim lock files whose owner process died
 
 function loadConfig(): Config {
 	let rawText: string;
@@ -236,6 +244,190 @@ function sweepStaleTmp(): void {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process lock for the read-merge-rewrite critical section
+// ---------------------------------------------------------------------------
+
+/**
+ * persistEntries reads, merges, and rewrites the whole history file. Without
+ * a lock two pi processes can interleave and one entry is lost (TOCTOU):
+ *   A reads [x] -> merge [y,x]; B reads [x] -> merge [z,x];
+ *   A writes [y,x]; B writes [z,x]  => A's y is lost.
+ *
+ * We wrap the critical section in a per-history-file mutex built on a
+ * dedicated lock file (NOT the data file: writeAtomic renames the target so
+ * its inode changes, and a lock on the old inode would not protect the new
+ * file).
+ *
+ * Primitive: pure-Node O_EXCL (writeFileSync flag "wx") + a stale-PID probe
+ * (process.kill(pid, 0)) — the same pid-liveness idea sweepStaleTmp already
+ * uses. No flock (Node has no portable built-in; shell flock(1) is Linux-only
+ * and breaks macOS), no native deps, no hybrid. The plugin already assumes a
+ * local POSIX fs via writeAtomic's rename; on a non-local fs the lock degrades
+ * to today's best-effort behavior (never worse than now).
+ *
+ * Self-repair: a lock is treated as stale (and reclaimed) when its owner pid
+ * is dead, the lock file is corrupt/unreadable, OR the lock file is older than
+ * LOCK_STALE_AGE_MS. A history write holds the lock for milliseconds at most,
+ * so an old lock means the owner crashed or hung — or a reused pid made
+ * process.kill(pid,0) falsely report it alive. The age check closes that
+ * PID-reuse blind spot without any manual command: wedged locks simply age
+ * out and get reclaimed on the next write. sweepStaleLocks() also reclaims
+ * stale locks at startup. Reclaiming a stale lock never loses data because a
+ * dead/hung owner can no longer write anyway.
+ */
+const LOCK_RETRY_MAX = 60; // bounded so a wedged lock cannot livelock forever
+const LOCK_RETRY_BACKOFF_MS = 5; // short busy-wait when the lock is genuinely held
+const LOCK_STALE_AGE_MS = 10_000; // a held lock older than this is wedged → auto-reclaim
+
+function lockFileFor(historyFile: string): string {
+	return `${historyFile}.lock`;
+}
+
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false; // ESRCH (not running) or EPERM on some platforms
+	}
+}
+
+/**
+ * A lock is stale (safe to reclaim) when its owner pid is dead, the lock file is
+ * corrupt/unreadable, or the lock file is older than LOCK_STALE_AGE_MS. The age
+ * check is what makes the lock self-repairing: a prompt-history write holds the
+ * lock for milliseconds at most, so an old lock means the owner crashed or
+ * hung (or a reused pid made process.kill(pid,0) falsely report it alive).
+ * Reclaiming a stale lock never loses data — a dead/hung owner can no longer
+ * write anyway.
+ */
+function isLockStale(file: string, ownerPid: number | undefined): boolean {
+	if (ownerPid === undefined || !Number.isInteger(ownerPid)) return true; // corrupt
+	if (!isPidAlive(ownerPid)) return true; // owner dead
+	try {
+		return Date.now() - statSync(file).mtimeMs > LOCK_STALE_AGE_MS; // wedged / PID reuse
+	} catch {
+		return true; // unreadable / missing
+	}
+}
+
+/**
+ * Best-effort mutex acquisition. On any unexpected error it returns and the
+ * caller proceeds without a lock, degrading to the pre-lock behavior (never
+ * worse than today). Bounded retries prevent a wedged lock from livelocking.
+ */
+function acquireHistoryLock(historyFile: string): void {
+	const lockFile = lockFileFor(historyFile);
+	ensurePrivateDirs();
+	try {
+		mkdirSync(dirname(lockFile), { recursive: true, mode: 0o700 });
+	} catch {
+		// Directory already exists.
+	}
+	for (let attempt = 0; attempt < LOCK_RETRY_MAX; attempt++) {
+		try {
+			writeFileSync(lockFile, String(process.pid), {
+				encoding: "utf8",
+				mode: 0o600,
+				flag: "wx",
+			});
+			return; // acquired
+		} catch (e) {
+			const code = (e as NodeJS.ErrnoException).code;
+			if (code !== "EEXIST") {
+				// Unexpected error: do not block writes; proceed without a lock
+				// (degrades to the old best-effort behavior, never worse).
+				return;
+			}
+			// Lock exists — reclaim it if stale (dead/corrupt owner, or wedged long
+			// enough that the holder must have crashed/hung). See isLockStale.
+			let ownerPid: number | undefined;
+			try {
+				ownerPid = Number.parseInt(readFileSync(lockFile, "utf8").trim(), 10);
+			} catch {
+				ownerPid = undefined; // unreadable → isLockStale treats as stale
+			}
+			if (isLockStale(lockFile, ownerPid)) {
+				// Remove and retry the O_EXCL create. If another writer won the
+				// race to reclaim, our next O_EXCL gets EEXIST again and we loop
+				// — O_EXCL is atomic, so this race is harmless.
+				try {
+					unlinkSync(lockFile);
+				} catch {
+					// Someone else already removed it; fine.
+				}
+				continue;
+			}
+			// Genuinely held: brief busy-wait backoff, then retry. (Low-frequency
+			// write path; holds are normally sub-millisecond.)
+			const end = Date.now() + LOCK_RETRY_BACKOFF_MS;
+			while (Date.now() < end) {
+				// spin briefly
+			}
+		}
+	}
+	// Exhausted retries: do not block the write path. Proceed without a lock
+	// (best-effort, same as the pre-lock behavior) rather than stalling.
+}
+
+/**
+ * Release a lock we hold. Unlinks the lock file only if it still records our
+ * pid, so we never delete another owner's lock.
+ */
+function releaseHistoryLock(historyFile: string): void {
+	const lockFile = lockFileFor(historyFile);
+	try {
+		const ownerPid = Number.parseInt(readFileSync(lockFile, "utf8").trim(), 10);
+		if (ownerPid === process.pid) unlinkSync(lockFile);
+	} catch {
+		// Lock file gone or unreadable: nothing to release.
+	}
+}
+
+/**
+ * Reclaim one stale lock file if its owner is dead/corrupt/wedged (see isLockStale).
+ */
+function reclaimStaleLock(file: string): void {
+	let ownerPid: number | undefined;
+	try {
+		ownerPid = Number.parseInt(readFileSync(file, "utf8").trim(), 10);
+	} catch {
+		ownerPid = undefined;
+	}
+	if (!isLockStale(file, ownerPid)) return;
+	try {
+		unlinkSync(file);
+	} catch {
+		// Lost the race or already gone.
+	}
+}
+
+/**
+ * Reclaim stale lock files at startup (self-repair for crashed/hung owners).
+ *
+ * IMPORTANT: never scan the shared ~/.pi/agent/ directory for "*.lock" — that
+ * would delete pi core's or other extensions' legitimate long-held locks. We
+ * only touch our own lock files: the single global lock (a named file in the
+ * shared dir, checked directly by path) and the project locks in our private
+ * prompt-histories/ dir (filtered to *.json.lock, this plugin's lock naming).
+ */
+function sweepStaleLocks(): void {
+	// Global: check only our own named lock file, not the shared directory.
+	reclaimStaleLock(lockFileFor(GLOBAL_HISTORY_FILE));
+	// Project: our private directory — safe to scan, filtered to our naming.
+	let names: string[];
+	try {
+		names = readdirSync(PROJECT_HISTORY_DIR);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".json.lock")) continue;
+		reclaimStaleLock(join(PROJECT_HISTORY_DIR, name));
+	}
+}
+
 export function historyFileFor(cwd: string): string {
 	if (config.scope === "global") return GLOBAL_HISTORY_FILE;
 	const sanitized = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "root";
@@ -269,11 +461,6 @@ function isPersistable(entry: string): boolean {
 	return true;
 }
 
-/**
- * Merge-flush the live history into the file. Both sides are filtered by the
- * current config, exact duplicates collapse (newest first), so entries added
- * by a concurrent pi process survive.
- */
 /** Write an in-memory list to disk, filtered by isPersistable. Used by the
  * destructive commands that must hit disk even when recording is disabled. */
 function persistMemory(file: string, entries: string[]): void {
@@ -283,17 +470,24 @@ function persistMemory(file: string, entries: string[]): void {
 /**
  * Merge-flush the live history into the file, honoring the dedup setting. The
  * on-disk file is re-read and re-merged on every attempt so an entry added by a
- * concurrent pi process is not lost (best-effort; no file lock).
+ * concurrent pi process is not lost. The whole read-merge-rewrite critical
+ * section is guarded by a per-file lock (see acquireHistoryLock) to close the
+ * TOCTOU lost-update window between concurrent pi processes.
  */
 function persistEntries(file: string, live: string[]): void {
 	if (!config.enabled) return;
 	const MAX_ATTEMPTS = 3;
-	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-		const merged = mergeEntries(live, loadEntries(file));
-		saveEntries(file, merged);
-		const after = loadEntries(file);
-		const mergedSet = new Set(merged);
-		if (!after.some((e) => !mergedSet.has(e))) return;
+	acquireHistoryLock(file);
+	try {
+		for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+			const merged = mergeEntries(live, loadEntries(file));
+			saveEntries(file, merged);
+			const after = loadEntries(file);
+			const mergedSet = new Set(merged);
+			if (!after.some((e) => !mergedSet.has(e))) return;
+		}
+	} finally {
+		releaseHistoryLock(file);
 	}
 }
 
