@@ -238,7 +238,7 @@ class SearchDockComponent extends Container {
 		lines.push(
 			row(
 				dim(
-					`scope: ${this.scope === "all" ? "all (global + projects)" : "project"}   ·   Tab toggles scope`,
+					`scope: ${this.scope === "all" ? "all (all projects)" : "project"}   ·   Tab toggles scope`,
 				),
 			),
 		);

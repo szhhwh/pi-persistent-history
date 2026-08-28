@@ -16,10 +16,10 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 | 内容 | 路径 |
 |---|---|
 | 配置 | `~/.pi/agent/prompt-history.config.json` |
-| 全局历史 | `~/.pi/agent/prompt-history.json` |
-| 项目级历史 | `~/.pi/agent/prompt-histories/<dir>.json` |
+| 按项目历史 | `~/.pi/agent/prompt-histories/<目录>.json` |
+| 全局视图（所有项目合并） | `~/.pi/agent/prompt-history.json` |
 
-这些文件只有你自己能读写。
+历史**始终按项目分开保存**，不同目录的输入互不混杂；全局视图由所有项目的历史合并而来。这些文件只有你自己能读写。
 
 ## 配置面板（GUI）
 
@@ -33,7 +33,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 - ↑/↓ 选择选项，`Enter` / `Space` 切换布尔/枚举值（`enabled`、`scope`、`dedup`、`recordCommands`）
 - 数值选项（`maxEntries`、`maxEntryChars`、`minLength`）按 `Enter` 打开单行文本输入框，`Esc` 取消，非法输入会回退并提示
-- 每次修改**即时生效**并写入磁盘， Esc 关闭面板
+- 每次修改**即时生效**并写入磁盘，Esc 关闭面板
 
 非交互模式（无 GUI）下 `/history-settings` 会直接打印当前状态文本。
 
@@ -43,7 +43,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 - 直接键入即在历史中实时过滤；命中的子串会高亮
 - ↑/↓（或再按一次 Ctrl+R）在结果间移动；最上面的框里显示当前搜索词
-- 按 **Tab** 在 `project`（当前 scope）与 `all`（全局文件 + 所有项目文件合并去重）两种搜索范围间切换
+- 按 **Tab** 在 `project`（仅当前项目）与 `all`（所有项目合并）两种搜索范围间切换
 - `Enter` 把选中的历史条目填入输入框，`Esc` 关闭弹窗
 
 也可以用命令打开同一个弹窗：
@@ -59,7 +59,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 /history pick                  TUI 中从列表挑选一条填入编辑器
 /history set <key> <value>     改选项（脚本/非交互用，等效面板）
 /history remove <substr>       删除包含子串的条目
-/history clear [--all] [--yes] 清空当前 scope 的文件（--all 清全部）
+/history clear [--all] [--yes] 清空当前项目的历史（--all 清空所有项目）
 /history reload               从磁盘重新加载历史
 /history path                 显示存储文件路径
 /history help                显示用法
@@ -72,7 +72,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 | enabled | on \| off | on | 是否把历史写入磁盘 |
 | maxEntries | 正整数 | 500 | 保留条目数上限 |
 | maxEntryChars | 正整数 | 100000 | 超过此长度的条目仅留内存、不落盘 |
-| scope | global \| project | global | 全局共享 / 按工作目录分别存储 |
+| scope | global \| project | global | ↑/↓ 默认浏览哪个视图：`global` = 所有项目合并的时间线；`project` = 仅当前项目。随时切换，不影响存储、不丢历史 |
 | dedup | consecutive \| always \| off | consecutive | 去重策略 |
 | recordCommands | on \| off | off | 是否持久化 `/` 和 `!` 输入 |
 | minLength | 非负整数 | 0 | 短于此长度的条目不记录 |
@@ -80,6 +80,8 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 ## 持久化语义
 
-- 每次写入都会按当前配置整理磁盘上的历史；调严选项后，不匹配的旧条目会在下次提交时被清除。
+- 每次输入都会同时记入当前项目的历史和全局合并视图；无论 `scope` 选哪个，两个视图都保持最新，随时切换不丢数据。
+- 全局视图丢失或损坏时会自动从各项目历史恢复，无需手工处理；删除它也不会丢任何历史。
+- 每次写入都会按当前配置整理文件；调严选项后，不匹配的旧条目会在下次写入时被清除。
 - 多个 pi 实例同时使用不会互相覆盖或丢失历史。
 - 即使 pi 异常退出，下次使用也会自动恢复正常，无需你手动处理。

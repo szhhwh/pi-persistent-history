@@ -25,14 +25,20 @@ import { createHash } from "node:crypto";
 const {
 	GLOBAL_HISTORY_FILE,
 	PROJECT_HISTORY_DIR,
-	loadEntries,
-	saveEntries,
+	loadHistoryEntries,
+	saveHistoryEntries,
+	loadProjectTexts,
+	loadViewTexts,
 	writeAtomic,
 	tightenFile,
 	isPersistable,
-	persistMemory,
-	mergeEntries,
-	listHistoryFiles,
+	forceSaveHistoryEntries,
+	mergeHistoryEntries,
+	persistHistoryEntries,
+	listProjectFiles,
+	rebuildGlobalIndex,
+	loadGlobalIndex,
+	projIdFor,
 	ensurePrivateDirs,
 } = __internals;
 
@@ -41,6 +47,16 @@ beforeEach(() => {
 	__resetConfig();
 	__setActiveEditor(null);
 });
+
+/** Build a HistoryEntry (ts descending by list position: newest first). */
+const ent = (t: string, ts?: number) => ({ t, ts: ts ?? 0 });
+
+/** Deterministic newest-first seed: texts [a, b, c] → ts 3, 2, 1. */
+const seed = (file: string, arr: string[]) =>
+	saveHistoryEntries(file, arr.map((t, i) => ({ t, ts: arr.length - i })));
+
+/** Read back just the texts of a history file. */
+const texts = (file: string) => loadHistoryEntries(file).map((e) => e.t);
 
 // ---------------------------------------------------------------------------
 // historyFileFor
@@ -117,82 +133,111 @@ describe("historyFileFor", () => {
 });
 
 // ---------------------------------------------------------------------------
-// loadEntries
+// projIdFor
 // ---------------------------------------------------------------------------
 
-describe("loadEntries", () => {
+describe("projIdFor", () => {
+	it("derives the project id from the project file basename", () => {
+		const pf = projectHistoryFileFor("/proj/x");
+		expect(projIdFor("/proj/x")).toBe(pf.slice(PROJECT_HISTORY_DIR.length + 1, -".json".length));
+	});
+});
+
+// ---------------------------------------------------------------------------
+// loadHistoryEntries
+// ---------------------------------------------------------------------------
+
+describe("loadHistoryEntries", () => {
 	it("returns [] for a missing file", () => {
-		expect(loadEntries(join(TEST_HOME, "nope.json"))).toEqual([]);
+		expect(loadHistoryEntries(join(TEST_HOME, "nope.json"))).toEqual([]);
 	});
 
 	it("returns [] for corrupt JSON", () => {
 		const f = join(TEST_HOME, "corrupt.json");
 		writeFileSync(f, "{ not valid json");
-		expect(loadEntries(f)).toEqual([]);
+		expect(loadHistoryEntries(f)).toEqual([]);
 	});
 
-	it("returns [] for non-array JSON (number)", () => {
-		const f = join(TEST_HOME, "num.json");
-		writeFileSync(f, "5");
-		expect(loadEntries(f)).toEqual([]);
+	it("returns [] for non-array JSON (number / object)", () => {
+		const f1 = join(TEST_HOME, "num.json");
+		writeFileSync(f1, "5");
+		expect(loadHistoryEntries(f1)).toEqual([]);
+		const f2 = join(TEST_HOME, "obj.json");
+		writeFileSync(f2, "{}");
+		expect(loadHistoryEntries(f2)).toEqual([]);
 	});
 
-	it("returns [] for non-array JSON (object)", () => {
-		const f = join(TEST_HOME, "obj.json");
-		writeFileSync(f, "{}");
-		expect(loadEntries(f)).toEqual([]);
+	it("reads legacy plain-string arrays as empty (no migration)", () => {
+		const f = join(TEST_HOME, "legacy.json");
+		writeFileSync(f, JSON.stringify(["a", "b"]));
+		expect(loadHistoryEntries(f)).toEqual([]);
 	});
 
-	it("filters out non-string elements from an array", () => {
+	it("skips malformed items and keeps valid {t, ts} entries", () => {
 		const f = join(TEST_HOME, "mixed.json");
-		writeFileSync(f, JSON.stringify([1, "a", true, null, "b", {}, "c", undefined]));
-		expect(loadEntries(f)).toEqual(["a", "b", "c"]);
+		writeFileSync(
+			f,
+			JSON.stringify([
+				{ t: "a", ts: 3 },
+				1,
+				"x",
+				null,
+				{ t: "b", ts: 2 },
+				{ t: 5, ts: 1 }, // non-string t
+				{ ts: 1 }, // missing t
+				{ t: "c" }, // missing ts
+				{ t: "d", ts: "nope" }, // non-numeric ts
+			]),
+		);
+		expect(loadHistoryEntries(f)).toEqual([
+			{ t: "a", ts: 3 },
+			{ t: "b", ts: 2 },
+		]);
 	});
 
-	it("returns a valid string[] as-is", () => {
-		const f = join(TEST_HOME, "valid.json");
-		const entries = ["alpha", "beta", "gamma"];
-		writeFileSync(f, JSON.stringify(entries));
-		expect(loadEntries(f)).toEqual(entries);
+	it("keeps the optional p field when present", () => {
+		const f = join(TEST_HOME, "proj.json");
+		writeFileSync(f, JSON.stringify([{ t: "a", ts: 1, p: "proj-abc" }]));
+		expect(loadHistoryEntries(f)).toEqual([{ t: "a", ts: 1, p: "proj-abc" }]);
 	});
 
 	it("returns [] for an empty array", () => {
 		const f = join(TEST_HOME, "empty.json");
 		writeFileSync(f, "[]");
-		expect(loadEntries(f)).toEqual([]);
+		expect(loadHistoryEntries(f)).toEqual([]);
 	});
 
 	it("tightens file permissions on load", () => {
 		const f = join(TEST_HOME, "loose.json");
-		writeFileSync(f, JSON.stringify(["a", "b"]));
+		writeFileSync(f, JSON.stringify([{ t: "a", ts: 1 }]));
 		chmodSync(f, 0o644);
 		expect(statSync(f).mode & 0o077).not.toBe(0);
-		loadEntries(f);
+		loadHistoryEntries(f);
 		expect(statSync(f).mode & 0o077).toBe(0);
 	});
 });
 
 // ---------------------------------------------------------------------------
-// saveEntries
+// saveHistoryEntries
 // ---------------------------------------------------------------------------
 
-describe("saveEntries", () => {
-	it("writes a JSON string[] that loadEntries can read back", () => {
+describe("saveHistoryEntries", () => {
+	it("writes entries that loadHistoryEntries reads back", () => {
 		const f = join(TEST_HOME, "save.json");
-		const entries = ["x", "y", "z"];
-		saveEntries(f, entries);
-		expect(loadEntries(f)).toEqual(entries);
+		const entries = [ent("x", 3), ent("y", 2), ent("z", 1)];
+		saveHistoryEntries(f, entries);
+		expect(loadHistoryEntries(f)).toEqual(entries);
 	});
 
 	it("creates the file with mode 0600", () => {
 		const f = join(TEST_HOME, "save_perms.json");
-		saveEntries(f, ["a"]);
+		saveHistoryEntries(f, [ent("a")]);
 		expect(statSync(f).mode & 0o777).toBe(0o600);
 	});
 
 	it("creates the parent directory with mode 0700", () => {
 		const f = join(TEST_HOME, "subdir", "save.json");
-		saveEntries(f, ["a"]);
+		saveHistoryEntries(f, [ent("a")]);
 		expect(statSync(join(TEST_HOME, "subdir")).mode & 0o777).toBe(0o700);
 	});
 });
@@ -304,131 +349,281 @@ describe("isPersistable", () => {
 });
 
 // ---------------------------------------------------------------------------
-// persistMemory
+// forceSaveHistoryEntries
 // ---------------------------------------------------------------------------
 
-describe("persistMemory", () => {
+describe("forceSaveHistoryEntries", () => {
 	it("filters non-persistable entries and applies the maxEntries cap", () => {
 		config.maxEntries = 3;
 		config.minLength = 2;
 		const f = join(TEST_HOME, "persist.json");
-		persistMemory(f, ["a", "bb", "cc", "dd", "ee"]);
+		forceSaveHistoryEntries(f, [ent("a"), ent("bb"), ent("cc"), ent("dd"), ent("ee")]);
 		// "a" too short (minLength=2), rest OK, capped to 3
-		expect(loadEntries(f)).toEqual(["bb", "cc", "dd"]);
+		expect(texts(f)).toEqual(["bb", "cc", "dd"]);
 	});
 
 	it("writes an empty array when no entries are persistable", () => {
 		config.minLength = 10;
 		const f = join(TEST_HOME, "empty.json");
-		persistMemory(f, ["a", "b", "c"]);
-		expect(loadEntries(f)).toEqual([]);
+		forceSaveHistoryEntries(f, [ent("a"), ent("b"), ent("c")]);
+		expect(texts(f)).toEqual([]);
 	});
 
 	it("writes all entries when under the cap", () => {
 		config.maxEntries = 10;
 		const f = join(TEST_HOME, "all.json");
-		persistMemory(f, ["a", "b", "c"]);
-		expect(loadEntries(f)).toEqual(["a", "b", "c"]);
+		forceSaveHistoryEntries(f, [ent("a"), ent("b"), ent("c")]);
+		expect(texts(f)).toEqual(["a", "b", "c"]);
 	});
 });
 
 // ---------------------------------------------------------------------------
-// mergeEntries
+// mergeHistoryEntries
 // ---------------------------------------------------------------------------
 
-describe("mergeEntries", () => {
+describe("mergeHistoryEntries", () => {
 	it("places live entries before disk entries (newest-first)", () => {
 		config.dedup = "off";
 		config.maxEntries = 100;
-		expect(mergeEntries(["x", "y"], ["z", "w"])).toEqual(["x", "y", "z", "w"]);
+		expect(mergeHistoryEntries([ent("x"), ent("y")], [ent("z"), ent("w")])).toEqual([
+			ent("x"),
+			ent("y"),
+			ent("z"),
+			ent("w"),
+		]);
 	});
 
 	it("dedup off keeps all entries, sliced to maxEntries", () => {
 		config.dedup = "off";
 		config.maxEntries = 3;
-		expect(mergeEntries(["a", "b"], ["c", "d"])).toEqual(["a", "b", "c"]);
+		expect(mergeHistoryEntries([ent("a"), ent("b")], [ent("c"), ent("d")])).toEqual([
+			ent("a"),
+			ent("b"),
+			ent("c"),
+		]);
 	});
 
-	it("dedup consecutive collapses only adjacent duplicates", () => {
+	it("dedup consecutive collapses only adjacent duplicates (by text)", () => {
 		config.dedup = "consecutive";
 		config.maxEntries = 100;
-		// persistable = ["a","a","b","b","c"] → a, skip(adj a), b, skip(adj b), c
-		expect(mergeEntries(["a", "a", "b"], ["b", "c"])).toEqual(["a", "b", "c"]);
+		// persistable = [a, a, b, b, c] → a, skip(adj a), b, skip(adj b), c
+		expect(mergeHistoryEntries([ent("a"), ent("a"), ent("b")], [ent("b"), ent("c")])).toEqual([
+			ent("a"),
+			ent("b"),
+			ent("c"),
+		]);
 	});
 
 	it("dedup consecutive keeps non-adjacent duplicates", () => {
 		config.dedup = "consecutive";
 		config.maxEntries = 100;
-		// persistable = ["a","b","a","c"] → a, b, a(not adjacent to b), c
-		expect(mergeEntries(["a", "b"], ["a", "c"])).toEqual(["a", "b", "a", "c"]);
+		// persistable = [a, b, a, c] → a, b, a(not adjacent to b), c
+		expect(mergeHistoryEntries([ent("a"), ent("b")], [ent("a"), ent("c")])).toEqual([
+			ent("a"),
+			ent("b"),
+			ent("a"),
+			ent("c"),
+		]);
 	});
 
 	it("dedup always collapses all duplicates keeping first occurrence", () => {
 		config.dedup = "always";
 		config.maxEntries = 100;
-		// persistable = ["a","b","a","c"] → a, b, skip(seen a), c
-		expect(mergeEntries(["a", "b"], ["a", "c"])).toEqual(["a", "b", "c"]);
+		// persistable = [a, b, a, c] → a, b, skip(seen a), c
+		expect(mergeHistoryEntries([ent("a"), ent("b")], [ent("a"), ent("c")])).toEqual([
+			ent("a"),
+			ent("b"),
+			ent("c"),
+		]);
 	});
 
 	it("dedup always collapses all-identical input to a single entry", () => {
 		config.dedup = "always";
 		config.maxEntries = 100;
-		expect(mergeEntries(["a", "a", "a"], ["a", "a"])).toEqual(["a"]);
+		expect(mergeHistoryEntries([ent("a"), ent("a"), ent("a")], [ent("a"), ent("a")])).toEqual([
+			ent("a"),
+		]);
 	});
 
 	it("filters both live and disk by isPersistable", () => {
 		config.dedup = "off";
 		config.maxEntries = 100;
 		config.minLength = 3;
-		// live=["ab","abc"], disk=["de","def"] → persistable = ["abc","def"]
-		expect(mergeEntries(["ab", "abc"], ["de", "def"])).toEqual(["abc", "def"]);
+		// live=[ab, abc], disk=[de, def] → persistable = [abc, def]
+		expect(mergeHistoryEntries([ent("ab"), ent("abc")], [ent("de"), ent("def")])).toEqual([
+			ent("abc"),
+			ent("def"),
+		]);
 	});
 
 	it("caps to maxEntries", () => {
 		config.dedup = "always";
 		config.maxEntries = 2;
 		// a, b → break at 2
-		expect(mergeEntries(["a", "b"], ["c"])).toEqual(["a", "b"]);
+		expect(mergeHistoryEntries([ent("a"), ent("b")], [ent("c")])).toEqual([ent("a"), ent("b")]);
 	});
 });
 
 // ---------------------------------------------------------------------------
-// listHistoryFiles
+// persistHistoryEntries
 // ---------------------------------------------------------------------------
 
-describe("listHistoryFiles", () => {
-	it("returns [] when no files exist", () => {
-		expect(listHistoryFiles()).toEqual([]);
+describe("persistHistoryEntries", () => {
+	it("early-returns when disabled", () => {
+		config.enabled = false;
+		const f = join(TEST_HOME, "off.json");
+		seed(f, ["a"]);
+		persistHistoryEntries(f, [ent("b", 5)]);
+		expect(texts(f)).toEqual(["a"]);
 	});
 
-	it("returns the global file when it exists", () => {
-		saveEntries(GLOBAL_HISTORY_FILE, ["a"]);
-		expect(listHistoryFiles()).toEqual([GLOBAL_HISTORY_FILE]);
+	it("merges live with disk and releases the lock", () => {
+		const f = join(TEST_HOME, "merge.json");
+		seed(f, ["a"]);
+		persistHistoryEntries(f, [ent("b", 9)]);
+		expect(texts(f)).toEqual(["b", "a"]);
+		expect(exists(`${f}.lock`)).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// listProjectFiles / rebuildGlobalIndex / loadGlobalIndex
+// ---------------------------------------------------------------------------
+
+describe("listProjectFiles", () => {
+	it("returns [] when no project files exist", () => {
+		expect(listProjectFiles()).toEqual([]);
 	});
 
-	it("returns global + project files (global first)", () => {
-		saveEntries(GLOBAL_HISTORY_FILE, ["a"]);
-		saveEntries(join(PROJECT_HISTORY_DIR, "p1.json"), ["b"]);
-		saveEntries(join(PROJECT_HISTORY_DIR, "p2.json"), ["c"]);
-		const files = listHistoryFiles();
-		expect(files.length).toBe(3);
-		expect(files[0]).toBe(GLOBAL_HISTORY_FILE);
+	it("returns only project files — never the global view file", () => {
+		seed(GLOBAL_HISTORY_FILE, ["a"]);
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["b"]);
+		seed(join(PROJECT_HISTORY_DIR, "p2.json"), ["c"]);
+		const files = listProjectFiles();
 		expect(files).toContain(join(PROJECT_HISTORY_DIR, "p1.json"));
 		expect(files).toContain(join(PROJECT_HISTORY_DIR, "p2.json"));
-	});
-
-	it("returns only project files when global does not exist", () => {
-		saveEntries(join(PROJECT_HISTORY_DIR, "p1.json"), ["b"]);
-		expect(listHistoryFiles()).toEqual([join(PROJECT_HISTORY_DIR, "p1.json")]);
+		expect(files).not.toContain(GLOBAL_HISTORY_FILE);
+		expect(files.length).toBe(2);
 	});
 
 	it("excludes .json.lock files", () => {
-		saveEntries(join(PROJECT_HISTORY_DIR, "p1.json"), ["b"]);
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["b"]);
 		writeFileSync(join(PROJECT_HISTORY_DIR, "p1.json.lock"), String(process.pid), {
 			mode: 0o600,
 		});
-		const files = listHistoryFiles();
-		expect(files).toEqual([join(PROJECT_HISTORY_DIR, "p1.json")]);
+		expect(listProjectFiles()).toEqual([join(PROJECT_HISTORY_DIR, "p1.json")]);
+	});
+});
+
+describe("rebuildGlobalIndex", () => {
+	it("merges all project files newest-ts-first with per-text dedup", () => {
+		saveHistoryEntries(
+			join(PROJECT_HISTORY_DIR, "p2.json"),
+			["new-shared", "p2-only"].map((t, i) => ({ t, ts: 100 - i })),
+		);
+		saveHistoryEntries(
+			join(PROJECT_HISTORY_DIR, "p1.json"),
+			["old-shared", "p1-only"].map((t, i) => ({ t, ts: 50 - i })),
+		);
+		const rebuilt = rebuildGlobalIndex();
+		expect(rebuilt.map((e) => e.t)).toEqual(["new-shared", "p2-only", "old-shared", "p1-only"]);
+		// The same text in two files keeps the newest occurrence:
+		saveHistoryEntries(
+			join(PROJECT_HISTORY_DIR, "p1.json"),
+			["new-shared", "p1-only"].map((t, i) => ({ t, ts: 40 - i })),
+		);
+		const rebuilt2 = rebuildGlobalIndex();
+		expect(rebuilt2.map((e) => e.t)).toEqual(["new-shared", "p2-only", "p1-only"]);
+		// newest occurrence wins and is attributed to p2 (ts 100)
+		expect(rebuilt2.find((e) => e.t === "new-shared")?.p).toBe(
+			join(PROJECT_HISTORY_DIR, "p2.json").slice(PROJECT_HISTORY_DIR.length + 1, -".json".length),
+		);
+	});
+
+	it("writes the rebuilt view to GLOBAL_HISTORY_FILE", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["a", "b"]);
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(false);
+		rebuildGlobalIndex();
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(true);
+		expect(loadHistoryEntries(GLOBAL_HISTORY_FILE).map((e) => e.t)).toEqual(["a", "b"]);
+	});
+
+	it("applies the maxEntries cap", () => {
+		config.maxEntries = 2;
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["a", "b", "c"]);
+		expect(rebuildGlobalIndex().map((e) => e.t)).toEqual(["a", "b"]);
+	});
+
+	it("applies isPersistable (recordCommands off keeps / and ! out)", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["/cmd", "!ls", "plain"]);
+		expect(rebuildGlobalIndex().map((e) => e.t)).toEqual(["plain"]);
+	});
+});
+
+describe("loadGlobalIndex", () => {
+	it("rebuilds when the global view file is missing", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["a"]);
+		expect(loadGlobalIndex().map((e) => e.t)).toEqual(["a"]);
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(true);
+	});
+
+	it("rebuilds when the global view file is corrupt", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["a"]);
+		writeFileSync(GLOBAL_HISTORY_FILE, "{ not json");
+		expect(loadGlobalIndex().map((e) => e.t)).toEqual(["a"]);
+	});
+
+	it("reads the existing view without rebuilding when valid", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["from-project"]);
+		seed(GLOBAL_HISTORY_FILE, ["view-entry"]);
+		// Valid view: no rebuild → the project entry is NOT folded in.
+		expect(loadGlobalIndex().map((e) => e.t)).toEqual(["view-entry"]);
+	});
+
+	it("treats a valid-but-empty view as current (no rebuild)", () => {
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["from-project"]);
+		saveHistoryEntries(GLOBAL_HISTORY_FILE, []);
+		expect(loadGlobalIndex()).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// View readers
+// ---------------------------------------------------------------------------
+
+describe("loadViewTexts", () => {
+	it("project scope reads the project file", () => {
+		config.scope = "project";
+		seed(projectHistoryFileFor("/v/cwd"), ["p1", "p2"]);
+		seed(GLOBAL_HISTORY_FILE, ["g1"]);
+		expect(loadViewTexts("/v/cwd")).toEqual(["p1", "p2"]);
+	});
+
+	it("global scope reads the global view (rebuilding if needed)", () => {
+		config.scope = "global";
+		seed(projectHistoryFileFor("/v/cwd"), ["p1"]);
+		seed(GLOBAL_HISTORY_FILE, ["g1", "g2"]);
+		expect(loadViewTexts("/v/cwd")).toEqual(["g1", "g2"]);
+	});
+
+	it("global scope with a missing view rebuilds from project files", () => {
+		config.scope = "global";
+		saveHistoryEntries(
+			projectHistoryFileFor("/v/cwd"),
+			[{ t: "only", ts: 7 }],
+		);
+		expect(loadViewTexts("/v/cwd")).toEqual(["only"]);
+	});
+});
+
+describe("loadProjectTexts", () => {
+	it("returns the project file texts newest first", () => {
+		seed(projectHistoryFileFor("/t/cwd"), ["new", "old"]);
+		expect(loadProjectTexts("/t/cwd")).toEqual(["new", "old"]);
+	});
+
+	it("returns [] for a project with no file", () => {
+		expect(loadProjectTexts("/never/seeded")).toEqual([]);
 	});
 });
 
@@ -437,31 +632,27 @@ describe("listHistoryFiles", () => {
 // ---------------------------------------------------------------------------
 
 describe("getAllHistoryEntries", () => {
-	it("returns [] when no files exist", () => {
+	it("returns [] when no history exists anywhere", () => {
 		expect(getAllHistoryEntries()).toEqual([]);
 	});
 
-	it("merges global + project files, de-duplicated keeping first occurrence", () => {
-		saveEntries(GLOBAL_HISTORY_FILE, ["a", "b"]);
-		saveEntries(join(PROJECT_HISTORY_DIR, "p1.json"), ["b", "c"]);
-		// global first: a, b; then p1: c (b already seen)
-		expect(getAllHistoryEntries()).toEqual(["a", "b", "c"]);
+	it("returns the global merged view texts", () => {
+		seed(GLOBAL_HISTORY_FILE, ["a", "b"]);
+		seed(join(PROJECT_HISTORY_DIR, "p1.json"), ["c"]);
+		// Valid view present: project entries not folded in (they were already
+		// merged when the view was written).
+		expect(getAllHistoryEntries()).toEqual(["a", "b"]);
 	});
 
-	it("de-duplicates across multiple project files (global first)", () => {
-		saveEntries(GLOBAL_HISTORY_FILE, ["shared", "g1"]);
-		saveEntries(join(PROJECT_HISTORY_DIR, "p1.json"), ["shared", "p1"]);
-		saveEntries(join(PROJECT_HISTORY_DIR, "p2.json"), ["shared", "p2"]);
-		const result = getAllHistoryEntries();
-		expect(result.length).toBe(4);
-		expect(result.filter((e) => e === "shared").length).toBe(1);
-		expect(result).toContain("g1");
-		expect(result).toContain("p1");
-		expect(result).toContain("p2");
-		// Global entries come before any project entries
-		expect(result.indexOf("shared")).toBeLessThan(result.indexOf("p1"));
-		expect(result.indexOf("shared")).toBeLessThan(result.indexOf("p2"));
-		expect(result.indexOf("g1")).toBeLessThan(result.indexOf("p1"));
+	it("auto-rebuilds from project files when the view is missing", () => {
+		saveHistoryEntries(join(PROJECT_HISTORY_DIR, "p1.json"), [
+			{ t: "old", ts: 10 },
+			{ t: "older", ts: 5 },
+		]);
+		saveHistoryEntries(join(PROJECT_HISTORY_DIR, "p2.json"), [{ t: "new", ts: 20 }]);
+		expect(getAllHistoryEntries()).toEqual(["new", "old", "older"]);
+		// The view file now exists for next time.
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(true);
 	});
 });
 
@@ -470,24 +661,24 @@ describe("getAllHistoryEntries", () => {
 // ---------------------------------------------------------------------------
 
 describe("getHistoryEntries (no-editor branch)", () => {
-	// beforeEach sets __setActiveEditor(null) — exercises the loadEntries fallback.
+	// beforeEach sets __setActiveEditor(null) — exercises the loadProjectTexts fallback.
 
-	it("global scope: project view never returns the shared cross-project list", () => {
+	it("project view never returns the global view's cross-project list", () => {
 		config.scope = "global";
-		saveEntries(GLOBAL_HISTORY_FILE, ["from-project-a", "from-project-b"]);
-		// Regression: the Ctrl+R project view must be scoped to this cwd even
-		// when the shared global file holds every project's prompts.
+		seed(GLOBAL_HISTORY_FILE, ["from-project-a", "from-project-b"]);
+		// The Ctrl+R project view must be scoped to this cwd even when the
+		// global view holds every project's prompts.
 		expect(getHistoryEntries("/proj-c")).toEqual([]);
 	});
 
-	it("global scope: returns only the entries recorded for that cwd", () => {
+	it("returns only the entries recorded for that cwd", () => {
 		config.scope = "global";
-		saveEntries(projectHistoryFileFor("/proj-c"), ["own-1", "own-2"]);
-		saveEntries(projectHistoryFileFor("/other"), ["foreign"]);
+		seed(projectHistoryFileFor("/proj-c"), ["own-1", "own-2"]);
+		seed(projectHistoryFileFor("/other"), ["foreign"]);
 		expect(getHistoryEntries("/proj-c")).toEqual(["own-1", "own-2"]);
 	});
 
-	it("global scope: returns [] when the project file does not exist", () => {
+	it("returns [] when the project file does not exist", () => {
 		config.scope = "global";
 		expect(getHistoryEntries("/some/cwd")).toEqual([]);
 	});
@@ -495,8 +686,7 @@ describe("getHistoryEntries (no-editor branch)", () => {
 	it("respects project scope (reads the project file for that cwd)", () => {
 		config.scope = "project";
 		const cwd = "/proj/dir";
-		const f = historyFileFor(cwd);
-		saveEntries(f, ["x", "y"]);
+		seed(historyFileFor(cwd), ["x", "y"]);
 		expect(getHistoryEntries(cwd)).toEqual(["x", "y"]);
 	});
 });

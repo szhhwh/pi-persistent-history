@@ -20,12 +20,22 @@ const {
 	CONFIG_KEYS,
 	HELP_TEXT,
 	configValueAsString,
-	loadEntries,
-	saveEntries,
+	loadHistoryEntries,
+	saveHistoryEntries,
+	loadProjectTexts,
+	projIdFor,
 	GLOBAL_HISTORY_FILE,
 	PROJECT_HISTORY_DIR,
 	PersistentHistoryEditor,
 } = __internals;
+
+/** Deterministic newest-first seed for a history file. */
+const seed = (file: string, arr: string[]) =>
+	saveHistoryEntries(file, arr.map((t, i) => ({ t, ts: arr.length - i })));
+/** Read back just the texts of a history file. */
+const texts = (file: string) => loadHistoryEntries(file).map((e) => e.t);
+/** The project file for the default test cwd. */
+const projectFileFor = () => __internals.projectHistoryFileFor("/test-cwd");
 
 beforeEach(() => {
 	cleanHome();
@@ -249,7 +259,11 @@ describe("handleHistoryCommand", () => {
 
 		it("lists seeded disk entries with numbering", async () => {
 			const ctx = makeCtx();
-			saveEntries(historyFileFor("/test-cwd"), ["alpha", "beta", "gamma"]);
+			saveHistoryEntries(historyFileFor("/test-cwd"), [
+				{ t: "alpha", ts: 3 },
+				{ t: "beta", ts: 2 },
+				{ t: "gamma", ts: 1 },
+			]);
 			await handleHistoryCommand("show", ctx);
 			const text = ctx._notifications[0].text;
 			expect(text).toContain("Recent 3 of 3 entries:");
@@ -260,7 +274,13 @@ describe("handleHistoryCommand", () => {
 
 		it("respects a count argument ('show 2') capping the list", async () => {
 			const ctx = makeCtx();
-			saveEntries(historyFileFor("/test-cwd"), ["a", "b", "c", "d", "e"]);
+			saveHistoryEntries(historyFileFor("/test-cwd"), [
+				{ t: "a", ts: 5 },
+				{ t: "b", ts: 4 },
+				{ t: "c", ts: 3 },
+				{ t: "d", ts: 2 },
+				{ t: "e", ts: 1 },
+			]);
 			await handleHistoryCommand("show 2", ctx);
 			const text = ctx._notifications[0].text;
 			expect(text).toContain("Recent 2 of 5 entries:");
@@ -324,13 +344,15 @@ describe("handleHistoryCommand", () => {
 		it("removes matching entries from disk and memory, notifying the count", async () => {
 			const ctx = makeCtx();
 			const file = historyFileFor("/test-cwd");
-			saveEntries(file, ["apple", "banana", "cherry"]);
+			seed(file, ["apple", "banana", "cherry"]);
 			await handleHistoryCommand("remove an", ctx);
 			// "banana" contains "an"; "apple" and "cherry" do not
 			expect(ctx._notifications[0].level).toBe("info");
 			expect(ctx._notifications[0].text).toContain("Removed 1 entr");
-			// disk reflects the removal
-			expect(loadEntries(file)).toEqual(["apple", "cherry"]);
+			// disk reflects the removal — scrubbed in BOTH stores (the global view
+			// spans every project, so it is always scrubbed too)
+			expect(texts(file)).toEqual(["apple", "cherry"]);
+			expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["apple", "cherry"]);
 		});
 
 		it("works against the live editor memory when active", async () => {
@@ -351,7 +373,7 @@ describe("handleHistoryCommand", () => {
 
 		it("notifies zero removed when nothing matches", async () => {
 			const ctx = makeCtx();
-			saveEntries(historyFileFor("/test-cwd"), ["apple", "banana"]);
+			seed(historyFileFor("/test-cwd"), ["apple", "banana"]);
 			await handleHistoryCommand("remove zzz", ctx);
 			expect(ctx._notifications[0].text).toContain("Removed 0");
 		});
@@ -360,25 +382,34 @@ describe("handleHistoryCommand", () => {
 	describe("clear", () => {
 		it("refuses without --yes when hasUI is false (warning)", async () => {
 			const ctx = makeCtx();
-			saveEntries(historyFileFor("/test-cwd"), ["a", "b"]);
+			seed(historyFileFor("/test-cwd"), ["a", "b"]);
 			await handleHistoryCommand("clear", ctx);
 			expect(ctx._notifications[0].level).toBe("warning");
 			expect(ctx._notifications[0].text).toContain("Refusing to clear");
 		});
 
-		it("clears the current scope file to [] with --yes (global scope)", async () => {
+		it("clears this project's file and purges its entries from the global view", async () => {
 			const ctx = makeCtx();
-			const file = historyFileFor("/test-cwd");
-			saveEntries(file, ["a", "b", "c"]);
-			expect(loadEntries(file).length).toBe(3);
+			const pf = projectFileFor();
+			seed(pf, ["mine-1", "mine-2"]);
+			saveHistoryEntries(GLOBAL_HISTORY_FILE, [
+				{ t: "mine-1", ts: 30, p: projIdFor("/test-cwd") },
+				{ t: "foreign", ts: 20, p: "other-project" },
+				{ t: "mine-2", ts: 10, p: projIdFor("/test-cwd") },
+			]);
 			await handleHistoryCommand("clear --yes", ctx);
 			expect(ctx._notifications[0].level).toBe("info");
 			expect(ctx._notifications[0].text).toContain("Cleared");
-			expect(loadEntries(file)).toEqual([]);
+			// This project's own file is empty; the global view keeps ONLY the
+			// other project's entries.
+			expect(texts(pf)).toEqual([]);
+			expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["foreign"]);
 		});
 
 		it("clears the live editor memory too", async () => {
 			const ctx = makeCtx();
+			config.scope = "project";
+			seed(historyFileFor("/test-cwd"), ["a", "b"]);
 			const editor = makeMockEditor("/test-cwd", ["a", "b"]);
 			__setActiveEditor(editor);
 			await handleHistoryCommand("clear --yes", ctx);
@@ -390,20 +421,20 @@ describe("handleHistoryCommand", () => {
 			config.scope = "project";
 			const f1 = historyFileFor("/proj-a");
 			const f2 = historyFileFor("/proj-b");
-			saveEntries(f1, ["a"]);
-			saveEntries(f2, ["b"]);
-			saveEntries(GLOBAL_HISTORY_FILE, ["g"]);
+			seed(f1, ["a"]);
+			seed(f2, ["b"]);
+			seed(GLOBAL_HISTORY_FILE, ["g"]);
 			// sanity: three files exist
-			expect(loadEntries(f1).length).toBe(1);
-			expect(loadEntries(f2).length).toBe(1);
-			expect(loadEntries(GLOBAL_HISTORY_FILE).length).toBe(1);
+			expect(loadHistoryEntries(f1).length).toBe(1);
+			expect(loadHistoryEntries(f2).length).toBe(1);
+			expect(loadHistoryEntries(GLOBAL_HISTORY_FILE).length).toBe(1);
 			await handleHistoryCommand("clear --all --yes", ctx);
 			expect(ctx._notifications[0].level).toBe("info");
 			expect(ctx._notifications[0].text).toContain("Deleted 3 history file(s).");
 			// all gone
-			expect(loadEntries(f1)).toEqual([]);
-			expect(loadEntries(f2)).toEqual([]);
-			expect(loadEntries(GLOBAL_HISTORY_FILE)).toEqual([]);
+			expect(loadHistoryEntries(f1)).toEqual([]);
+			expect(loadHistoryEntries(f2)).toEqual([]);
+			expect(loadHistoryEntries(GLOBAL_HISTORY_FILE)).toEqual([]);
 		});
 	});
 
@@ -418,7 +449,7 @@ describe("handleHistoryCommand", () => {
 		it("reloads from disk and notifies the count when an editor is active", async () => {
 			const ctx = makeCtx();
 			const file = historyFileFor("/test-cwd");
-			saveEntries(file, ["x", "y", "z"]);
+			seed(file, ["x", "y", "z"]);
 			const editor = makeMockEditor("/test-cwd", []);
 			__setActiveEditor(editor);
 			await handleHistoryCommand("reload", ctx);
@@ -430,7 +461,7 @@ describe("handleHistoryCommand", () => {
 		it("notes recording is off when config.enabled is false", async () => {
 			const ctx = makeCtx();
 			config.enabled = false;
-			saveEntries(historyFileFor("/test-cwd"), ["x"]);
+			seed(historyFileFor("/test-cwd"), ["x"]);
 			const editor = makeMockEditor("/test-cwd", []);
 			__setActiveEditor(editor);
 			await handleHistoryCommand("reload", ctx);
@@ -441,7 +472,7 @@ describe("handleHistoryCommand", () => {
 	describe("pick", () => {
 		it("warns when not in tui mode", async () => {
 			const ctx = makeCtx();
-			saveEntries(historyFileFor("/test-cwd"), ["apple"]);
+			seed(historyFileFor("/test-cwd"), ["apple"]);
 			await handleHistoryCommand("pick", ctx);
 			expect(ctx._notifications[0].level).toBe("warning");
 			expect(ctx._notifications[0].text).toContain("interactive mode");
@@ -449,7 +480,7 @@ describe("handleHistoryCommand", () => {
 
 		it("in tui mode, sets the editor text to the full chosen entry", async () => {
 			const ctx = makeCtx({ mode: "tui", hasUI: true, _selected: "banana" });
-			saveEntries(historyFileFor("/test-cwd"), ["apple", "banana", "cherry"]);
+			seed(historyFileFor("/test-cwd"), ["apple", "banana", "cherry"]);
 			let captured = "";
 			ctx.ui.setEditorText = (text: string) => {
 				captured = text;
@@ -511,7 +542,7 @@ describe("handleSettingsCommand", () => {
 describe("getHistoryEntries", () => {
 	it("returns disk entries when there is no active editor", () => {
 		config.scope = "project";
-		saveEntries(historyFileFor("/test-cwd"), ["one", "two"]);
+		seed(historyFileFor("/test-cwd"), ["one", "two"]);
 		expect(getHistoryEntries("/test-cwd")).toEqual(["one", "two"]);
 	});
 
@@ -525,7 +556,7 @@ describe("getHistoryEntries", () => {
 	it("global scope: never returns the shared list even with an active editor", () => {
 		// Regression: with an editor seeded from the global file, the project
 		// view used to leak every project's prompts via live memory.
-		saveEntries(GLOBAL_HISTORY_FILE, ["cross-a"]);
+		saveHistoryEntries(GLOBAL_HISTORY_FILE, [{ t: "cross-a", ts: 1 }]);
 		const editor = makeMockEditor("/test-cwd", ["cross-a"]);
 		__setActiveEditor(editor);
 		expect(getHistoryEntries("/test-cwd")).toEqual([]);

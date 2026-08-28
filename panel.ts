@@ -78,7 +78,8 @@ export async function openConfigPanel(ctx: ExtensionCommandContext): Promise<voi
 			{
 				id: "scope",
 				label: "Scope",
-				description: "global = one shared history; project = one file per working directory.",
+				description:
+					"Which view ↑/↓ browses by default: global = all projects merged; project = this directory only.",
 				currentValue: config.scope,
 				values: ["global", "project"],
 			},

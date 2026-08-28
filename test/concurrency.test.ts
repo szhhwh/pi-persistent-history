@@ -5,7 +5,7 @@ import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { GLOBAL_HISTORY_FILE, lockFileFor, loadEntries, LOCK_STALE_AGE_MS } = __internals;
+const { GLOBAL_HISTORY_FILE, lockFileFor, loadHistoryEntries, LOCK_STALE_AGE_MS } = __internals;
 
 // ---------------------------------------------------------------------------
 // Shared worker script
@@ -27,7 +27,7 @@ beforeAll(() => {
 		`const id = process.env.PI_WORKER_ID ?? "X";`,
 		`const M = Number(process.env.PI_WORKER_M ?? "1");`,
 		`for (let i = 0; i < M; i++) {`,
-		`  __internals.persistEntries(file, [id + "-" + i]);`,
+		`  __internals.persistHistoryEntries(file, [{ t: id + "-" + i, ts: Date.now() }]);`,
 		`}`,
 	].join("\n");
 	writeFileSync(workerScript, code);
@@ -70,7 +70,7 @@ describe("cross-process concurrency", () => {
 		const exits = await Promise.all(ids.map((id) => spawnWorker(id, M)));
 		expect(exits.every((e) => e === 0)).toBe(true);
 
-		const entries = loadEntries(GLOBAL_HISTORY_FILE);
+		const entries = loadHistoryEntries(GLOBAL_HISTORY_FILE).map((e) => e.t);
 		const unique = new Set(entries);
 		expect(unique.size).toBe(K * M); // 75 unique entries, no loss
 
@@ -90,7 +90,7 @@ describe("cross-process concurrency", () => {
 		const exit = await spawnWorker("A", 5);
 		expect(exit).toBe(0);
 
-		const entries = loadEntries(GLOBAL_HISTORY_FILE);
+		const entries = loadHistoryEntries(GLOBAL_HISTORY_FILE).map((e) => e.t);
 		expect(new Set(entries).size).toBe(5);
 		expect(exists(lockFile)).toBe(false);
 	});
@@ -105,7 +105,7 @@ describe("cross-process concurrency", () => {
 		const exit = await spawnWorker("A", 5);
 		expect(exit).toBe(0);
 
-		const entries = loadEntries(GLOBAL_HISTORY_FILE);
+		const entries = loadHistoryEntries(GLOBAL_HISTORY_FILE).map((e) => e.t);
 		expect(new Set(entries).size).toBe(5);
 		expect(exists(lockFile)).toBe(false);
 	});
@@ -117,7 +117,7 @@ describe("cross-process concurrency", () => {
 		const exit = await spawnWorker("A", 3);
 		expect(exit).toBe(0);
 
-		const entries = loadEntries(GLOBAL_HISTORY_FILE);
+		const entries = loadHistoryEntries(GLOBAL_HISTORY_FILE).map((e) => e.t);
 		expect(new Set(entries).size).toBe(3);
 		expect(exists(lockFile)).toBe(false);
 	});

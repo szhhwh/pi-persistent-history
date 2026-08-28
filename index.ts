@@ -4,14 +4,19 @@
  * Persists the input editor's prompt history (the buffer browsed with
  * up/down arrows) to disk so it survives restarts of pi.
  *
- * Storage (history content):
- *   - scope "global":  ~/.pi/agent/prompt-history.json            (shared everywhere)
- *   - scope "project": ~/.pi/agent/prompt-histories/<dir>.json    (per working directory)
- *   In global scope a per-project copy is ALSO kept under prompt-histories/
- *   (only entries submitted from that directory), so the Ctrl+R dock's
- *   "project" view stays scoped to the current directory instead of showing
- *   the shared cross-project list.
- *   Config:            ~/.pi/agent/prompt-history.config.json
+ * Storage:
+ *   - Authoritative store, always per working directory (regardless of scope):
+ *       ~/.pi/agent/prompt-histories/<dir>.json
+ *   - Global merged view across every project (derived from the project
+ *     files; rebuilt automatically when missing or unreadable):
+ *       ~/.pi/agent/prompt-history.json
+ *   - Config: ~/.pi/agent/prompt-history.config.json
+ * `scope` does NOT change what is stored — every submit always updates both
+ * stores. It only picks the default view the ↑/↓ keys browse: "global" =
+ * the merged cross-project view, "project" = this directory's own history.
+ * Ctrl+R's Tab temporarily flips the dock between the same two views.
+ * Entries are stored as {t: text, ts: timestamp} (+ `p`: project id in the
+ * global view) so the merged view can be rebuilt in true chronological order.
  * Files are created 0600 (dirs 0700) and existing files are tightened on load.
  *
  * Configure with the /history-settings command, or search with /history:
@@ -30,7 +35,7 @@
  *   maxEntries     <number>                 history size cap (default 500)
  *   maxEntryChars  <number>                 entries longer than this stay in
  *                                          memory only, never written (default 100000)
- *   scope          global | project         shared or per-directory (default global)
+ *   scope          global | project         default ↑/↓ view (default global)
  *   dedup          consecutive | always | off  duplicate handling (default consecutive)
  *   recordCommands on | off                 persist "/" and "!" inputs (default off)
  *   minLength      <number>                 skip entries shorter than this (default 0)
@@ -38,11 +43,14 @@
  *                                          dock, fixed height (default 10)
  *
  * Persistence semantics:
- *   - The on-disk file is re-filtered against the current config on every
- *     write; tightening maxEntryChars/minLength/recordCommands purges
- *     non-matching entries on the next submit.
- *   - Writes merge with the on-disk file (exact duplicates collapse,
- *     newest first), so entries added by another pi process survive.
+ *   - Every submit credits the entry to the project's own file AND to the
+ *     global merged view. Both stores are re-filtered against the current
+ *     config on every write; tightening maxEntryChars/minLength/recordCommands
+ *     purges non-matching entries on the next write to that file.
+ *   - The global view is derived data: deleting it loses nothing — it comes
+ *     back, rebuilt from the project files, on the next read.
+ *   - Writes merge with the on-disk files (dedup per config, newest first),
+ *     so entries added by another pi process survive.
  *   - The read-merge-rewrite critical section is guarded by a per-file lock
  *     (O_EXCL lock file + stale-pid + age probe) so concurrent pi processes
  *     cannot lose each other's entries (TOCTOU). Assumes ~/.pi lives on a local
@@ -73,13 +81,14 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { openConfigPanel } from "./panel";
 import { closeSearch, openSearch } from "./search";
 
 const HISTORY_HOME = process.env.PI_HISTORY_HOME ?? join(homedir(), ".pi", "agent");
 const CONFIG_FILE = join(HISTORY_HOME, "prompt-history.config.json");
+/** The global merged view (derived from the project files, auto-rebuilt). */
 const GLOBAL_HISTORY_FILE = join(HISTORY_HOME, "prompt-history.json");
 const PROJECT_HISTORY_DIR = join(HISTORY_HOME, "prompt-histories");
 
@@ -254,7 +263,7 @@ function sweepStaleTmp(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * persistEntries reads, merges, and rewrites the whole history file. Without
+ * persistHistoryEntries reads, merges, and rewrites the whole history file. Without
  * a lock two pi processes can interleave and one entry is lost (TOCTOU):
  *   A reads [x] -> merge [y,x]; B reads [x] -> merge [z,x];
  *   A writes [y,x]; B writes [z,x]  => A's y is lost.
@@ -434,9 +443,8 @@ function sweepStaleLocks(): void {
 }
 
 /**
- * Per-project history file for a cwd — one file per working directory,
- * independent of config.scope. Written on every submit (both scopes), it is
- * the single source of truth for the Ctrl+R dock's "project" view.
+ * Per-project history file for a cwd — one file per working directory. This
+ * is the authoritative store: written on EVERY submit regardless of scope.
  */
 export function projectHistoryFileFor(cwd: string): string {
 	const sanitized = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "root";
@@ -444,27 +452,72 @@ export function projectHistoryFileFor(cwd: string): string {
 	return join(PROJECT_HISTORY_DIR, `${sanitized.slice(0, 100)}-${hash}.json`);
 }
 
+/** Stable per-cwd id used to attribute entries in the global view. */
+function projIdFor(cwd: string): string {
+	return basename(projectHistoryFileFor(cwd)).replace(/\.json$/, "");
+}
+
+/**
+ * The file backing the current VIEW (what ↑/↓ browses and what show/pick/
+ * path/reload use): the project's own history, or the global merged view.
+ * This does NOT select what is stored — every submit always updates both
+ * stores; scope only picks which one the UI browses by default.
+ */
 export function historyFileFor(cwd: string): string {
 	if (config.scope === "global") return GLOBAL_HISTORY_FILE;
 	return projectHistoryFileFor(cwd);
 }
 
-function loadEntries(file: string): string[] {
-	try {
-		tightenFile(file); // tighten perms even for non-array / corrupt files
-		const data: unknown = JSON.parse(readFileSync(file, "utf8"));
-		if (Array.isArray(data)) {
-			return data.filter((x): x is string => typeof x === "string");
-		}
-	} catch {
-		// Missing or corrupt file: start fresh.
-	}
-	return [];
+/**
+ * One stored history entry. Project files and the global view share this
+ * shape; `p` (project id) is only stored in the global view. Timestamps make
+ * the view rebuildable in true chronological order across projects.
+ */
+interface HistoryEntry {
+	t: string;
+	ts: number;
+	p?: string;
 }
 
-function saveEntries(file: string, entries: string[]): void {
-	// Compact JSON: the history file is rewritten on every submit.
+/**
+ * Read one history file. Unknown/malformed items are skipped; a missing,
+ * corrupt, or legacy (plain-string) file reads as empty. Permission
+ * tightening still applies even for unreadable content.
+ */
+function loadHistoryEntries(file: string): HistoryEntry[] {
+	try {
+		tightenFile(file);
+		const data: unknown = JSON.parse(readFileSync(file, "utf8"));
+		if (!Array.isArray(data)) return [];
+		const out: HistoryEntry[] = [];
+		for (const x of data) {
+			if (typeof x !== "object" || x === null) continue;
+			const e = x as Record<string, unknown>;
+			if (typeof e.t !== "string") continue;
+			if (typeof e.ts !== "number" || !Number.isFinite(e.ts)) continue;
+			out.push({ t: e.t, ts: e.ts, ...(typeof e.p === "string" ? { p: e.p } : {}) });
+		}
+		return out;
+	} catch {
+		// Missing or corrupt file: start fresh.
+		return [];
+	}
+}
+
+function saveHistoryEntries(file: string, entries: HistoryEntry[]): void {
+	// Compact JSON: history files are rewritten on every submit.
 	writeAtomic(file, JSON.stringify(entries));
+}
+
+/** One project's texts, newest first. */
+function loadProjectTexts(cwd: string): string[] {
+	return loadHistoryEntries(projectHistoryFileFor(cwd)).map((e) => e.t);
+}
+
+/** Texts of the current view file — what the editor seeds ↑/↓ from. */
+function loadViewTexts(cwd: string): string[] {
+	if (config.scope === "global") return loadGlobalIndex().map((e) => e.t);
+	return loadProjectTexts(cwd);
 }
 
 /** Whether an entry may be written to disk under the current config. */
@@ -475,54 +528,66 @@ function isPersistable(entry: string): boolean {
 	return true;
 }
 
-/** Write an in-memory list to disk, filtered by isPersistable. Used by the
- * destructive commands that must hit disk even when recording is disabled. */
-function persistMemory(file: string, entries: string[]): void {
-	saveEntries(file, entries.filter(isPersistable).slice(0, config.maxEntries));
+/** Rewrite a history file directly. Used by destructive/maintenance commands
+ * that must hit disk even when recording is disabled. */
+function forceSaveHistoryEntries(file: string, entries: HistoryEntry[]): void {
+	saveHistoryEntries(file, entries.filter((e) => isPersistable(e.t)).slice(0, config.maxEntries));
 }
 
 /**
- * Merge-flush the live history into the file, honoring the dedup setting. The
- * on-disk file is re-read and re-merged on every attempt so an entry added by a
- * concurrent pi process is not lost. The whole read-merge-rewrite critical
+ * Merge the live entries (newest first) with the on-disk list, honoring the
+ * dedup setting. BOTH sides are re-filtered through isPersistable, so
+ * tightening maxEntryChars/minLength/recordCommands purges non-matching
+ * entries from the file on its next write. Capped to maxEntries.
+ */
+function mergeHistoryEntries(live: HistoryEntry[], disk: HistoryEntry[]): HistoryEntry[] {
+	const persistable = [
+		...live.filter((e) => isPersistable(e.t)),
+		...disk.filter((e) => isPersistable(e.t)),
+	];
+	if (config.dedup === "off") {
+		return persistable.slice(0, config.maxEntries); // keep all
+	}
+	const seen = new Set<string>();
+	const merged: HistoryEntry[] = [];
+	for (const entry of persistable) {
+		if (config.dedup === "always" && seen.has(entry.t)) continue;
+		if (
+			config.dedup === "consecutive" &&
+			merged.length > 0 &&
+			merged[merged.length - 1].t === entry.t
+		) {
+			continue;
+		}
+		seen.add(entry.t);
+		merged.push(entry);
+		if (merged.length >= config.maxEntries) break;
+	}
+	return merged;
+}
+
+/**
+ * Merge-flush the live entries into the file, honoring the dedup setting. The
+ * on-disk file is re-read and re-merged on every attempt so an entry added by
+ * a concurrent pi process is not lost. The whole read-merge-rewrite critical
  * section is guarded by a per-file lock (see acquireHistoryLock) to close the
  * TOCTOU lost-update window between concurrent pi processes.
  */
-function persistEntries(file: string, live: string[]): void {
+function persistHistoryEntries(file: string, live: HistoryEntry[]): void {
 	if (!config.enabled) return;
 	const MAX_ATTEMPTS = 3;
 	acquireHistoryLock(file);
 	try {
 		for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-			const merged = mergeEntries(live, loadEntries(file));
-			saveEntries(file, merged);
-			const after = loadEntries(file);
-			const mergedSet = new Set(merged);
-			if (!after.some((e) => !mergedSet.has(e))) return;
+			const merged = mergeHistoryEntries(live, loadHistoryEntries(file));
+			saveHistoryEntries(file, merged);
+			const after = loadHistoryEntries(file);
+			const mergedSet = new Set(merged.map((e) => e.t));
+			if (!after.some((e) => !mergedSet.has(e.t))) return;
 		}
 	} finally {
 		releaseHistoryLock(file);
 	}
-}
-
-/** Merge live memory with the on-disk list, honoring the dedup setting. */
-function mergeEntries(live: string[], disk: string[]): string[] {
-	const persistable = [...live.filter(isPersistable), ...disk.filter(isPersistable)];
-	if (config.dedup === "off") {
-		return persistable.slice(0, config.maxEntries); // keep all
-	}
-	const seen = new Set<string>();
-	const merged: string[] = [];
-	for (const entry of persistable) {
-		if (config.dedup === "always" && seen.has(entry)) continue;
-		if (config.dedup === "consecutive" && merged.length > 0 && merged[merged.length - 1] === entry) {
-			continue;
-		}
-		seen.add(entry);
-		merged.push(entry);
-		if (merged.length >= config.maxEntries) break;
-	}
-	return merged;
 }
 
 /**
@@ -562,14 +627,9 @@ function recordEntry(
 	return h;
 }
 
-function listHistoryFiles(): string[] {
+/** All per-project history files (the authoritative stores). */
+function listProjectFiles(): string[] {
 	const files: string[] = [];
-	try {
-		statSync(GLOBAL_HISTORY_FILE);
-		files.push(GLOBAL_HISTORY_FILE);
-	} catch {
-		// No global file.
-	}
 	try {
 		for (const f of readdirSync(PROJECT_HISTORY_DIR)) {
 			if (f.endsWith(".json")) files.push(join(PROJECT_HISTORY_DIR, f));
@@ -580,6 +640,54 @@ function listHistoryFiles(): string[] {
 	return files;
 }
 
+/** True when the global view file is missing, corrupt, or not an array. */
+function globalIndexNeedsRebuild(): boolean {
+	try {
+		tightenFile(GLOBAL_HISTORY_FILE);
+		const data: unknown = JSON.parse(readFileSync(GLOBAL_HISTORY_FILE, "utf8"));
+		return !Array.isArray(data);
+	} catch {
+		return true; // missing or corrupt
+	}
+}
+
+/**
+ * Rebuild the global merged view from the project files: newest timestamp
+ * first, one entry per distinct text (newest occurrence wins), filtered by
+ * isPersistable, capped to maxEntries. A pure derivation — the project files
+ * are untouched, so rebuilding can never lose history.
+ */
+function rebuildGlobalIndex(): HistoryEntry[] {
+	const all: HistoryEntry[] = [];
+	for (const file of listProjectFiles()) {
+		const projId = basename(file).replace(/\.json$/, "");
+		for (const e of loadHistoryEntries(file)) {
+			all.push({ t: e.t, ts: e.ts, p: projId });
+		}
+	}
+	all.sort((a, b) => b.ts - a.ts);
+	const seen = new Set<string>();
+	const rebuilt: HistoryEntry[] = [];
+	for (const e of all) {
+		if (!isPersistable(e.t) || seen.has(e.t)) continue;
+		seen.add(e.t);
+		rebuilt.push(e);
+		if (rebuilt.length >= config.maxEntries) break;
+	}
+	saveHistoryEntries(GLOBAL_HISTORY_FILE, rebuilt);
+	return rebuilt;
+}
+
+/**
+ * The global merged view: every project's recent entries, newest first.
+ * Rebuilt automatically from the project files when the file is missing or
+ * unreadable — it is derived data, so deleting it loses nothing.
+ */
+function loadGlobalIndex(): HistoryEntry[] {
+	if (globalIndexNeedsRebuild()) return rebuildGlobalIndex();
+	return loadHistoryEntries(GLOBAL_HISTORY_FILE);
+}
+
 // ---------------------------------------------------------------------------
 // Editor
 // ---------------------------------------------------------------------------
@@ -587,35 +695,27 @@ function listHistoryFiles(): string[] {
 /**
  * History entries for one project (cwd), newest first — the Ctrl+R dock's
  * "project" view. Strictly scoped to this cwd:
- *   - project scope: the live editor memory is seeded from — and flushed to —
+ *   - project view: the live editor memory is seeded from — and flushed to —
  *     this project's own file, so it is used directly.
- *   - global scope: the live memory is the shared cross-project list; using
- *     it here would mix other projects into the view, so this reads only the
+ *   - global view: the live memory is the cross-project list; using it here
+ *     would mix other projects into the view, so this reads only the
  *     per-project file for this cwd (addToHistory keeps it up to date).
  */
 export function getHistoryEntries(cwd: string): string[] {
 	if (config.scope === "project" && activeEditor && activeEditor.cwd === cwd) {
 		return activeEditor.memory();
 	}
-	return loadEntries(projectHistoryFileFor(cwd));
+	return loadProjectTexts(cwd);
 }
 
 /**
- * All history entries across every scope (global file + all project files),
- * merged and de-duplicated, newest occurrence kept. Used by the search dock's
- * "all" mode so a query can span global and per-project histories at once.
+ * The global merged view — every project's recent entries, newest first.
+ * Backed by the global file (rebuilt from the project files when missing or
+ * unreadable). Used by the search dock's "all" mode so a query spans all
+ * projects at once.
  */
 export function getAllHistoryEntries(): string[] {
-	const merged: string[] = [];
-	const seen = new Set<string>();
-	for (const file of listHistoryFiles()) {
-		for (const entry of loadEntries(file)) {
-			if (seen.has(entry)) continue;
-			seen.add(entry);
-			merged.push(entry);
-		}
-	}
-	return merged;
+	return loadGlobalIndex().map((e) => e.t);
 }
 
 /**
@@ -636,12 +736,12 @@ class PersistentHistoryEditor extends CustomEditor {
 		this.cwd = cwd;
 		const host = this.hostHistory();
 		if (host) {
-			host.history = loadEntries(historyFileFor(cwd));
+			host.history = loadViewTexts(cwd);
 			host.historyIndex = -1;
 			host.historyDraft = null;
 		} else {
 			this.degraded = true;
-			this.fallbackMemory = loadEntries(historyFileFor(cwd));
+			this.fallbackMemory = loadViewTexts(cwd);
 		}
 		this.seeded = true;
 	}
@@ -665,7 +765,7 @@ class PersistentHistoryEditor extends CustomEditor {
 	}
 
 	reloadFromDisk(): void {
-		this.setMemory(loadEntries(historyFileFor(this.cwd)));
+		this.setMemory(loadViewTexts(this.cwd));
 	}
 
 	addToHistory(text: string): void {
@@ -673,21 +773,22 @@ class PersistentHistoryEditor extends CustomEditor {
 		if (!trimmed) return;
 		const h = this.memory();
 		// In-memory recording always happens so native ↑/↓ keeps working;
-		// `enabled` only gates disk persistence (persistEntries early-returns),
-		// and must not change the dedup behavior chosen by the user. The dedup +
-		// cap logic lives in the pure `recordEntry` helper (also unit-tested).
+		// `enabled` only gates disk persistence (persistHistoryEntries
+		// early-returns), and must not change the dedup behavior chosen by the
+		// user. The dedup + cap logic lives in the pure `recordEntry` helper
+		// (also unit-tested).
 		const next = recordEntry(h, trimmed, config.dedup, config.maxEntries);
 		h.splice(0, h.length, ...next);
 		if (this.seeded) {
-			persistEntries(historyFileFor(this.cwd), h);
-			// Global scope records into the shared file; also credit the entry to
-			// this project's own file so the Ctrl+R "project" view (which reads
-			// only that file) reflects prompts actually used here. Merging just
-			// the new entry — never the whole shared list — is what keeps other
-			// projects' prompts out of the per-project file.
-			if (config.scope === "global") {
-				persistEntries(projectHistoryFileFor(this.cwd), [trimmed]);
-			}
+			// Storage is view-independent: every submit credits the entry to this
+			// project's own file AND to the global merged view. Merging just the
+			// new entry — never the whole in-memory list — is what keeps other
+			// projects' prompts out of the per-project file in every view.
+			const now = Date.now();
+			persistHistoryEntries(projectHistoryFileFor(this.cwd), [{ t: trimmed, ts: now }]);
+			persistHistoryEntries(GLOBAL_HISTORY_FILE, [
+				{ t: trimmed, ts: now, p: projIdFor(this.cwd) },
+			]);
 		}
 	}
 
@@ -722,7 +823,7 @@ const SUBCOMMANDS: AutocompleteItem[] = [
 	{ value: "pick", label: "pick", description: "Pick an entry into the editor" },
 	{ value: "set", label: "set", description: "Change an option" },
 	{ value: "remove", label: "remove", description: "Delete matching entries" },
-	{ value: "clear", label: "clear", description: "Wipe stored history (--all for every file)" },
+	{ value: "clear", label: "clear", description: "Wipe this project's history (--all: everything)" },
 	{ value: "reload", label: "reload", description: "Reload history from disk" },
 	{ value: "path", label: "path", description: "Show storage file location" },
 	{ value: "help", label: "help", description: "Show usage" },
@@ -745,7 +846,7 @@ export function onOff(b: boolean): string {
 
 export function statusText(cwd: string): string {
 	const file = activeEditor ? historyFileFor(activeEditor.cwd) : historyFileFor(cwd);
-	const diskEntries = loadEntries(file);
+	const diskEntries = loadHistoryEntries(file);
 	const liveCount = activeEditor ? activeEditor.memory().length : diskEntries.length;
 	const lines = [
 		"Prompt history",
@@ -784,16 +885,18 @@ const HELP_TEXT = [
 	"                         minLength <number>",
 	"                         searchRows <number>",
 	"  remove <substr>      delete entries containing <substr>",
-	"  clear [--all] [--yes]  wipe current scope's file (--all: every file)",
+	"  clear [--all] [--yes]  wipe this project's history (--all: everything)",
 	"  reload               reload history from disk",
 	"  path                 show storage file location",
 	"",
 	"Notes:",
 	"- Open the interactive config panel with /history-settings.",
-	"- recordCommands=off keeps / and ! inputs out of the history file.",
-	"- The file is re-filtered and merge-flushed on every submit: config",
-	"  changes purge non-matching entries, and entries written by another pi",
-	"  process survive.",
+	"- recordCommands=off keeps / and ! inputs out of the history files.",
+	"- History is always stored per project; `scope` only picks which view the",
+	"  up/down arrows browse by default (Tab flips it in the search dock).",
+	"- Files are re-filtered and merge-flushed on every submit: config changes",
+	"  purge non-matching entries, and entries written by another pi process",
+	"  survive.",
 ].join("\n");
 
 function truncateLabel(entry: string): string {
@@ -868,7 +971,7 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 		case "show": {
 			const n = Number.parseInt(rest[0] ?? "10", 10);
 			const count = Number.isInteger(n) && n > 0 ? Math.min(n, 50) : 10;
-			const entries = activeEditor ? activeEditor.memory() : loadEntries(historyFileFor(cwd));
+			const entries = activeEditor ? activeEditor.memory() : loadViewTexts(cwd);
 			if (entries.length === 0) {
 				ctx.ui.notify("History is empty.", "info");
 				return;
@@ -889,7 +992,7 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 				ctx.ui.notify("/history pick is only available in interactive mode.", "warning");
 				return;
 			}
-			const entries = activeEditor ? activeEditor.memory() : loadEntries(historyFileFor(cwd));
+			const entries = activeEditor ? activeEditor.memory() : loadViewTexts(cwd);
 			if (entries.length === 0) {
 				ctx.ui.notify("History is empty.", "info");
 				return;
@@ -935,23 +1038,21 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 				ctx.ui.notify("Usage: /history remove <substring>", "warning");
 				return;
 			}
-			const file = historyFileFor(cwd);
-			const entries = activeEditor ? activeEditor.memory() : loadEntries(file);
-			const kept = entries.filter((e) => !e.includes(needle));
-			let removed = entries.length - kept.length;
-			activeEditor?.setMemory(kept);
-			// Explicit destructive command: always hit disk, even when disabled,
-			// and honor isPersistable so / and ! inputs never leak.
-			persistMemory(file, kept);
-			// Global scope also keeps a per-project copy (the Ctrl+R "project"
-			// view reads it); scrub that file too so removal applies everywhere.
-			if (config.scope === "global") {
-				const pf = projectHistoryFileFor(cwd);
-				const proj = loadEntries(pf);
-				const projKept = proj.filter((e) => !e.includes(needle));
-				removed += proj.length - projKept.length;
-				persistMemory(pf, projKept);
+			// Scrub this project's file and the global view (which spans every
+			// project). Explicit destructive command: always hit disk, even when
+			// disabled, via forceSaveHistoryEntries (isPersistable honored).
+			const removedTexts = new Set<string>();
+			for (const file of [projectHistoryFileFor(cwd), GLOBAL_HISTORY_FILE]) {
+				const entries = loadHistoryEntries(file);
+				for (const e of entries) if (e.t.includes(needle)) removedTexts.add(e.t);
+				forceSaveHistoryEntries(file, entries.filter((e) => !e.t.includes(needle)));
 			}
+			if (activeEditor) {
+				const mem = activeEditor.memory();
+				for (const e of mem) if (e.includes(needle)) removedTexts.add(e);
+				activeEditor.setMemory(mem.filter((e) => !e.includes(needle)));
+			}
+			const removed = removedTexts.size;
 			ctx.ui.notify(
 				`Removed ${removed} entr${removed === 1 ? "y" : "ies"} from memory and disk.`,
 				"info",
@@ -965,8 +1066,8 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			if (!yes) {
 				if (ctx.hasUI) {
 					const message = all
-						? "Delete ALL stored prompt history (global file and every project file)?"
-						: `Delete all entries in ${historyFileFor(cwd)}?`;
+						? "Delete ALL stored prompt history (every project file and the global view)?"
+						: "Delete all prompt history recorded in this project?";
 					const confirmed = await ctx.ui.confirm("Clear prompt history", message);
 					if (!confirmed) return;
 				} else {
@@ -979,7 +1080,7 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			}
 			if (all) {
 				let removed = 0;
-				for (const file of listHistoryFiles()) {
+				for (const file of [...listProjectFiles(), GLOBAL_HISTORY_FILE]) {
 					try {
 						unlinkSync(file);
 						removed++;
@@ -991,16 +1092,22 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 				ctx.ui.notify(`Deleted ${removed} history file(s).`, "info");
 				return;
 			}
-			const file = historyFileFor(cwd);
-			activeEditor?.setMemory([]);
+			// Clear THIS project: wipe its own file and purge its entries from the
+			// global view, then re-seed the live view from disk. Other projects'
+			// history is untouched.
+			forceSaveHistoryEntries(projectHistoryFileFor(cwd), []);
+			const projId = projIdFor(cwd);
+			const index = loadHistoryEntries(GLOBAL_HISTORY_FILE);
+			const keptIndex = index.filter((e) => e.p !== projId);
 			// Explicit destructive command: always hit disk, even when disabled.
-			saveEntries(file, []);
-			const remaining = listHistoryFiles().filter((f) => f !== file).length;
-			const note =
-				remaining > 0
-					? ` ${remaining} other history file(s) remain — use /history clear --all to wipe everything.`
-					: "";
-			ctx.ui.notify(`Cleared ${file}.${note}`, "info");
+			forceSaveHistoryEntries(GLOBAL_HISTORY_FILE, keptIndex);
+			const purged = index.length - keptIndex.length;
+			activeEditor?.reloadFromDisk();
+			ctx.ui.notify(
+				`Cleared this project's history ` +
+					`(${purged} global view ${purged === 1 ? "entry" : "entries"} removed).`,
+				"info",
+			);
 			return;
 		}
 
@@ -1048,12 +1155,14 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 			}
 			config.maxEntries = n;
 			saveConfig();
-			if (activeEditor && config.enabled) {
+			if (activeEditor) {
 				const h = activeEditor.memory();
-				if (h.length > n) {
-					h.length = n;
-					persistMemory(historyFileFor(activeEditor.cwd), h);
-				}
+				if (h.length > n) h.length = n;
+			}
+			// Shrink every on-disk store to the new cap.
+			for (const file of [...listProjectFiles(), GLOBAL_HISTORY_FILE]) {
+				const entries = loadHistoryEntries(file);
+				if (entries.length > n) forceSaveHistoryEntries(file, entries.slice(0, n));
 			}
 			return { ok: true, message: `Set maxEntries = ${n}` };
 		}
@@ -1070,26 +1179,12 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 			if (value !== "global" && value !== "project") {
 				return { ok: false, message: "Invalid value for scope: use global|project" };
 			}
-			const old = config.scope;
 			config.scope = value;
 			saveConfig();
-			if (old !== value && config.enabled) {
-				// project→global: fold the project's list into the shared file so
-				// native ↑/↓ keeps seeing it after the switch. global→project: just
-				// re-seed from this project's own file — carrying the cross-project
-				// list over would permanently mix other projects' prompts into the
-				// per-project file the Ctrl+R "project" view reads. Nothing is lost
-				// either way: entries stay in the files they were recorded in, and
-				// the "all" view still spans every file.
-				if (value === "global" && activeEditor) {
-					const previous = activeEditor.memory();
-					if (previous.length > 0) {
-						persistEntries(historyFileFor(activeEditor.cwd), previous);
-					}
-				}
-				activeEditor?.reloadFromDisk();
-			}
-			return { ok: true, message: `Set scope = ${value}` };
+			// scope only picks the default view; both stores are always current,
+			// so switching is just a re-seed of ↑/↓ from the new view file.
+			if (config.enabled) activeEditor?.reloadFromDisk();
+			return { ok: true, message: `Set scope = ${value} (↑/↓ view reloaded)` };
 		}
 		case "dedup": {
 			if (!["consecutive", "always", "off"].includes(value)) {
@@ -1283,14 +1378,19 @@ export const __internals = {
 	writeAtomic,
 	ensurePrivateDirs,
 	sweepStaleTmp,
-	loadEntries,
-	saveEntries,
+	loadHistoryEntries,
+	saveHistoryEntries,
+	loadProjectTexts,
+	loadViewTexts,
 	isPersistable,
-	persistMemory,
-	persistEntries,
-	mergeEntries,
+	forceSaveHistoryEntries,
+	persistHistoryEntries,
+	mergeHistoryEntries,
 	recordEntry,
-	listHistoryFiles,
+	listProjectFiles,
+	rebuildGlobalIndex,
+	loadGlobalIndex,
+	projIdFor,
 	isPidAlive,
 	isLockStale,
 	lockFileFor,

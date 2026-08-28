@@ -5,13 +5,25 @@ import {
 	config,
 	__setActiveEditor,
 	historyFileFor,
-	projectHistoryFileFor,
 	getHistoryEntries,
 } from "../index.ts";
 import { cleanHome, exists } from "./helpers.ts";
-import { writeFileSync } from "node:fs";
 
-const { recordEntry, PersistentHistoryEditor, loadEntries, GLOBAL_HISTORY_FILE } = __internals;
+const {
+	recordEntry,
+	PersistentHistoryEditor,
+	loadHistoryEntries,
+	saveHistoryEntries,
+	loadProjectTexts,
+	projIdFor,
+	GLOBAL_HISTORY_FILE,
+} = __internals;
+
+/** Deterministic newest-first seed for a history file. */
+const seed = (file: string, arr: string[]) =>
+	saveHistoryEntries(file, arr.map((t, i) => ({ t, ts: arr.length - i })));
+/** Read back just the texts of a history file. */
+const texts = (file: string) => loadHistoryEntries(file).map((e) => e.t);
 
 beforeEach(() => {
 	cleanHome();
@@ -120,18 +132,27 @@ describe("PersistentHistoryEditor hostHistory() feature detection", () => {
 });
 
 describe("PersistentHistoryEditor init(cwd) seeding", () => {
-	it("seeds fallbackMemory from the on-disk file (degraded)", () => {
+	it("seeds fallbackMemory from the project file (project view, degraded)", () => {
+		config.scope = "project";
 		const cwd = "/seed-degraded";
-		writeFileSync(historyFileFor(cwd), JSON.stringify(["s1", "s2"]));
+		seed(historyFileFor(cwd), ["s1", "s2"]);
 		const ed = makeDegraded(cwd);
 		expect(ed.memory()).toEqual(["s1", "s2"]);
 	});
 
-	it("seeds host.history from the on-disk file (non-degraded)", () => {
+	it("seeds host.history from the project file (project view, non-degraded)", () => {
+		config.scope = "project";
 		const cwd = "/seed-non";
-		writeFileSync(historyFileFor(cwd), JSON.stringify(["n1", "n2"]));
+		seed(historyFileFor(cwd), ["n1", "n2"]);
 		const ed = makeNonDegraded(cwd);
 		expect(ed.memory()).toEqual(["n1", "n2"]);
+	});
+
+	it("seeds from the global view when scope is global", () => {
+		config.scope = "global";
+		seed(GLOBAL_HISTORY_FILE, ["g1", "g2"]);
+		const ed = makeDegraded("/seed-global");
+		expect(ed.memory()).toEqual(["g1", "g2"]);
 	});
 });
 
@@ -144,11 +165,12 @@ describe("PersistentHistoryEditor addToHistory (degraded path)", () => {
 		expect(ed.memory()).toEqual(["y", "x"]);
 	});
 
-	it("persists to disk when seeded=true", () => {
+	it("persists to BOTH stores when seeded=true", () => {
 		const ed = makeDegraded("/persist-cwd");
 		ed.addToHistory("x");
 		ed.addToHistory("y");
-		expect(loadEntries(historyFileFor("/persist-cwd"))).toEqual(["y", "x"]);
+		expect(loadProjectTexts("/persist-cwd")).toEqual(["y", "x"]);
+		expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["y", "x"]);
 	});
 
 	it("does NOT write to disk when seeded=false", () => {
@@ -158,7 +180,8 @@ describe("PersistentHistoryEditor addToHistory (degraded path)", () => {
 		ed.cwd = "/no-seed";
 		ed.addToHistory("x");
 		expect(ed.memory()).toEqual(["x"]);
-		expect(loadEntries(historyFileFor("/no-seed"))).toEqual([]);
+		expect(loadProjectTexts("/no-seed")).toEqual([]);
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(false);
 	});
 });
 
@@ -205,14 +228,24 @@ describe("PersistentHistoryEditor setMemory", () => {
 });
 
 describe("PersistentHistoryEditor reloadFromDisk", () => {
-	it("replaces memory with the on-disk contents", () => {
+	it("replaces memory with the view file's contents", () => {
+		config.scope = "project";
 		const cwd = "/reload-cwd";
 		const ed = makeDegraded(cwd);
 		ed.setMemory(["a", "b"]);
-		// write a different file
-		writeFileSync(historyFileFor(cwd), JSON.stringify(["z", "y"]));
+		// Overwrite the project file behind the view.
+		seed(historyFileFor(cwd), ["z", "y"]);
 		ed.reloadFromDisk();
 		expect(ed.memory()).toEqual(["z", "y"]);
+	});
+
+	it("re-seeds from the global view when scope is global", () => {
+		config.scope = "global";
+		const ed = makeDegraded("/reload-global");
+		ed.setMemory(["a"]);
+		seed(GLOBAL_HISTORY_FILE, ["z"]);
+		ed.reloadFromDisk();
+		expect(ed.memory()).toEqual(["z"]);
 	});
 });
 
@@ -228,35 +261,39 @@ describe("PersistentHistoryEditor maxEntries cap in addToHistory", () => {
 	});
 });
 
-describe("PersistentHistoryEditor addToHistory cross-scope attribution", () => {
-	it("global scope: also credits the per-project file (project view stays accurate)", () => {
+describe("PersistentHistoryEditor addToHistory store attribution", () => {
+	it("credits BOTH the per-project file and the global view (any scope)", () => {
 		const ed = makeDegraded("/dual-cwd");
 		ed.addToHistory("only-here");
-		expect(loadEntries(projectHistoryFileFor("/dual-cwd"))).toEqual(["only-here"]);
+		expect(loadProjectTexts("/dual-cwd")).toEqual(["only-here"]);
+		const g = loadHistoryEntries(GLOBAL_HISTORY_FILE);
+		expect(g.map((e) => e.t)).toEqual(["only-here"]);
+		expect(g[0].p).toBe(projIdFor("/dual-cwd"));
 	});
 
-	it("global scope: project file gets ONLY the new entry, never the shared list", () => {
+	it("project file gets ONLY the new entry, never the cross-project list", () => {
 		const cwd = "/dual-isolated";
 		const ed = makeDegraded(cwd);
-		// Simulate a shared/global mix living in memory; only the newly typed
-		// entry may be credited to this project.
+		// Simulate a cross-project mix living in memory (global view); only the
+		// newly typed entry may be credited to this project's file.
 		ed.setMemory(["foreign-a", "foreign-b"]);
 		ed.addToHistory("mine");
-		expect(loadEntries(projectHistoryFileFor(cwd))).toEqual(["mine"]);
+		expect(loadProjectTexts(cwd)).toEqual(["mine"]);
 	});
 
-	it("global scope: honors isPersistable in the project copy (recordCommands off)", () => {
+	it("honors isPersistable in both stores (recordCommands off)", () => {
 		const ed = makeDegraded("/dual-cmd");
 		ed.addToHistory("/slash-command");
-		expect(loadEntries(projectHistoryFileFor("/dual-cmd"))).toEqual([]);
+		expect(loadProjectTexts("/dual-cmd")).toEqual([]);
+		expect(texts(GLOBAL_HISTORY_FILE)).toEqual([]);
 	});
 
-	it("project scope: writes only the project file (no global file)", () => {
+	it("project view: writes BOTH stores too (scope never changes storage)", () => {
 		config.scope = "project";
 		const ed = makeDegraded("/proj-only");
 		ed.addToHistory("p-entry");
-		expect(loadEntries(projectHistoryFileFor("/proj-only"))).toEqual(["p-entry"]);
-		expect(exists(GLOBAL_HISTORY_FILE)).toBe(false);
+		expect(loadProjectTexts("/proj-only")).toEqual(["p-entry"]);
+		expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["p-entry"]);
 	});
 });
 

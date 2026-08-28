@@ -18,8 +18,8 @@ const {
 	reclaimStaleLock,
 	sweepStaleLocks,
 	sweepStaleTmp,
-	loadEntries,
-	persistEntries,
+	loadHistoryEntries,
+	persistHistoryEntries,
 } = __internals;
 
 beforeEach(() => {
@@ -259,35 +259,35 @@ describe("sweepStaleTmp", () => {
 	});
 });
 
-describe("persistEntries", () => {
+describe("persistHistoryEntries", () => {
 	it("early-returns when config.enabled=false: no lock, file unchanged", () => {
 		config.enabled = false;
 		const hist = join(TEST_HOME, "prompt-history.json");
 		const lock = lockFileFor(hist);
 		// Pre-seed the data file so we can prove it is untouched.
-		writeFileSync(hist, JSON.stringify(["a"]), { mode: 0o600 });
-		persistEntries(hist, ["b"]);
+		writeFileSync(hist, JSON.stringify([{ t: "a", ts: 1 }]), { mode: 0o600 });
+		persistHistoryEntries(hist, [{ t: "b", ts: 2 }]);
 		expect(exists(lock)).toBe(false);
-		expect(loadEntries(hist)).toEqual(["a"]);
+		expect(loadHistoryEntries(hist)).toEqual([{ t: "a", ts: 1 }]);
 	});
 
 	it("writes merged entries under the lock and releases the lock afterward", () => {
 		config.enabled = true;
 		const hist = join(TEST_HOME, "prompt-history.json");
 		const lock = lockFileFor(hist);
-		persistEntries(hist, ["hello"]);
+		persistHistoryEntries(hist, [{ t: "hello", ts: 1 }]);
 		expect(exists(lock)).toBe(false); // lock cleaned up
-		expect(loadEntries(hist)).toContain("hello");
+		expect(loadHistoryEntries(hist).map((e) => e.t)).toContain("hello");
 	});
 
 	it("re-reads and merges disk content (newest first)", () => {
 		config.enabled = true;
 		const hist = join(TEST_HOME, "prompt-history.json");
 		const lock = lockFileFor(hist);
-		writeFileSync(hist, JSON.stringify(["a"]), { mode: 0o600 });
-		persistEntries(hist, ["b"]);
+		writeFileSync(hist, JSON.stringify([{ t: "a", ts: 1 }]), { mode: 0o600 });
+		persistHistoryEntries(hist, [{ t: "b", ts: 2 }]);
 		// Default dedup "consecutive": ["b", "a"] — b first (newest), a survives.
 		expect(exists(lock)).toBe(false);
-		expect(loadEntries(hist)).toEqual(["b", "a"]);
+		expect(loadHistoryEntries(hist).map((e) => e.t)).toEqual(["b", "a"]);
 	});
 });
