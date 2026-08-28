@@ -4,6 +4,7 @@ import {
 	__resetConfig,
 	__setActiveEditor,
 	historyFileFor,
+	projectHistoryFileFor,
 	getHistoryEntries,
 	getAllHistoryEntries,
 	__internals,
@@ -471,13 +472,22 @@ describe("getAllHistoryEntries", () => {
 describe("getHistoryEntries (no-editor branch)", () => {
 	// beforeEach sets __setActiveEditor(null) — exercises the loadEntries fallback.
 
-	it("returns loadEntries(historyFileFor(cwd)) for global scope", () => {
+	it("global scope: project view never returns the shared cross-project list", () => {
 		config.scope = "global";
-		saveEntries(GLOBAL_HISTORY_FILE, ["alpha", "beta"]);
-		expect(getHistoryEntries("/some/cwd")).toEqual(["alpha", "beta"]);
+		saveEntries(GLOBAL_HISTORY_FILE, ["from-project-a", "from-project-b"]);
+		// Regression: the Ctrl+R project view must be scoped to this cwd even
+		// when the shared global file holds every project's prompts.
+		expect(getHistoryEntries("/proj-c")).toEqual([]);
 	});
 
-	it("returns [] when no file exists", () => {
+	it("global scope: returns only the entries recorded for that cwd", () => {
+		config.scope = "global";
+		saveEntries(projectHistoryFileFor("/proj-c"), ["own-1", "own-2"]);
+		saveEntries(projectHistoryFileFor("/other"), ["foreign"]);
+		expect(getHistoryEntries("/proj-c")).toEqual(["own-1", "own-2"]);
+	});
+
+	it("global scope: returns [] when the project file does not exist", () => {
 		config.scope = "global";
 		expect(getHistoryEntries("/some/cwd")).toEqual([]);
 	});

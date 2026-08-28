@@ -5,12 +5,13 @@ import {
 	config,
 	__setActiveEditor,
 	historyFileFor,
+	projectHistoryFileFor,
 	getHistoryEntries,
 } from "../index.ts";
-import { cleanHome } from "./helpers.ts";
+import { cleanHome, exists } from "./helpers.ts";
 import { writeFileSync } from "node:fs";
 
-const { recordEntry, PersistentHistoryEditor, loadEntries } = __internals;
+const { recordEntry, PersistentHistoryEditor, loadEntries, GLOBAL_HISTORY_FILE } = __internals;
 
 beforeEach(() => {
 	cleanHome();
@@ -227,8 +228,41 @@ describe("PersistentHistoryEditor maxEntries cap in addToHistory", () => {
 	});
 });
 
+describe("PersistentHistoryEditor addToHistory cross-scope attribution", () => {
+	it("global scope: also credits the per-project file (project view stays accurate)", () => {
+		const ed = makeDegraded("/dual-cwd");
+		ed.addToHistory("only-here");
+		expect(loadEntries(projectHistoryFileFor("/dual-cwd"))).toEqual(["only-here"]);
+	});
+
+	it("global scope: project file gets ONLY the new entry, never the shared list", () => {
+		const cwd = "/dual-isolated";
+		const ed = makeDegraded(cwd);
+		// Simulate a shared/global mix living in memory; only the newly typed
+		// entry may be credited to this project.
+		ed.setMemory(["foreign-a", "foreign-b"]);
+		ed.addToHistory("mine");
+		expect(loadEntries(projectHistoryFileFor(cwd))).toEqual(["mine"]);
+	});
+
+	it("global scope: honors isPersistable in the project copy (recordCommands off)", () => {
+		const ed = makeDegraded("/dual-cmd");
+		ed.addToHistory("/slash-command");
+		expect(loadEntries(projectHistoryFileFor("/dual-cmd"))).toEqual([]);
+	});
+
+	it("project scope: writes only the project file (no global file)", () => {
+		config.scope = "project";
+		const ed = makeDegraded("/proj-only");
+		ed.addToHistory("p-entry");
+		expect(loadEntries(projectHistoryFileFor("/proj-only"))).toEqual(["p-entry"]);
+		expect(exists(GLOBAL_HISTORY_FILE)).toBe(false);
+	});
+});
+
 describe("live singleton editor via __setActiveEditor", () => {
-	it("getHistoryEntries uses the active editor's memory, then falls back to disk", () => {
+	it("project scope: getHistoryEntries uses the active editor's memory, then disk", () => {
+		config.scope = "project";
 		const cwd = "/singleton-cwd";
 		const ed = makeDegraded(cwd);
 		ed.addToHistory("hello");
@@ -238,5 +272,18 @@ describe("live singleton editor via __setActiveEditor", () => {
 		__setActiveEditor(null);
 		// no active editor → falls back to on-disk entries (persisted above)
 		expect(getHistoryEntries(cwd)).toEqual(["hello"]);
+	});
+
+	it("global scope: getHistoryEntries ignores the shared memory and reads the project file", () => {
+		const cwd = "/singleton-global";
+		const ed = makeDegraded(cwd);
+		// Memory holds a cross-project mix; the project view must NOT surface it.
+		ed.setMemory(["other-project-a", "other-project-b"]);
+		__setActiveEditor(ed);
+		expect(getHistoryEntries(cwd)).toEqual([]);
+		ed.addToHistory("typed-here");
+		// The dual-write credited the project file → now visible in the view.
+		expect(getHistoryEntries(cwd)).toEqual(["typed-here"]);
+		__setActiveEditor(null);
 	});
 });

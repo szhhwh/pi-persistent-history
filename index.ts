@@ -7,6 +7,10 @@
  * Storage (history content):
  *   - scope "global":  ~/.pi/agent/prompt-history.json            (shared everywhere)
  *   - scope "project": ~/.pi/agent/prompt-histories/<dir>.json    (per working directory)
+ *   In global scope a per-project copy is ALSO kept under prompt-histories/
+ *   (only entries submitted from that directory), so the Ctrl+R dock's
+ *   "project" view stays scoped to the current directory instead of showing
+ *   the shared cross-project list.
  *   Config:            ~/.pi/agent/prompt-history.config.json
  * Files are created 0600 (dirs 0700) and existing files are tightened on load.
  *
@@ -429,11 +433,20 @@ function sweepStaleLocks(): void {
 	}
 }
 
-export function historyFileFor(cwd: string): string {
-	if (config.scope === "global") return GLOBAL_HISTORY_FILE;
+/**
+ * Per-project history file for a cwd — one file per working directory,
+ * independent of config.scope. Written on every submit (both scopes), it is
+ * the single source of truth for the Ctrl+R dock's "project" view.
+ */
+export function projectHistoryFileFor(cwd: string): string {
 	const sanitized = cwd.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "root";
 	const hash = createHash("sha1").update(cwd).digest("hex").slice(0, 12);
 	return join(PROJECT_HISTORY_DIR, `${sanitized.slice(0, 100)}-${hash}.json`);
+}
+
+export function historyFileFor(cwd: string): string {
+	if (config.scope === "global") return GLOBAL_HISTORY_FILE;
+	return projectHistoryFileFor(cwd);
 }
 
 function loadEntries(file: string): string[] {
@@ -572,12 +585,19 @@ function listHistoryFiles(): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Current history entries (live memory when available, else on-disk), newest
- * first. Used by the search dock so it can scan both the in-memory list and
- * the persisted file.
+ * History entries for one project (cwd), newest first — the Ctrl+R dock's
+ * "project" view. Strictly scoped to this cwd:
+ *   - project scope: the live editor memory is seeded from — and flushed to —
+ *     this project's own file, so it is used directly.
+ *   - global scope: the live memory is the shared cross-project list; using
+ *     it here would mix other projects into the view, so this reads only the
+ *     per-project file for this cwd (addToHistory keeps it up to date).
  */
 export function getHistoryEntries(cwd: string): string[] {
-	return activeEditor ? activeEditor.memory() : loadEntries(historyFileFor(cwd));
+	if (config.scope === "project" && activeEditor && activeEditor.cwd === cwd) {
+		return activeEditor.memory();
+	}
+	return loadEntries(projectHistoryFileFor(cwd));
 }
 
 /**
@@ -658,7 +678,17 @@ class PersistentHistoryEditor extends CustomEditor {
 		// cap logic lives in the pure `recordEntry` helper (also unit-tested).
 		const next = recordEntry(h, trimmed, config.dedup, config.maxEntries);
 		h.splice(0, h.length, ...next);
-		if (this.seeded) persistEntries(historyFileFor(this.cwd), h);
+		if (this.seeded) {
+			persistEntries(historyFileFor(this.cwd), h);
+			// Global scope records into the shared file; also credit the entry to
+			// this project's own file so the Ctrl+R "project" view (which reads
+			// only that file) reflects prompts actually used here. Merging just
+			// the new entry — never the whole shared list — is what keeps other
+			// projects' prompts out of the per-project file.
+			if (config.scope === "global") {
+				persistEntries(projectHistoryFileFor(this.cwd), [trimmed]);
+			}
+		}
 	}
 
 	private hostHistory(): { history: string[]; historyIndex: number; historyDraft: unknown } | null {
@@ -908,11 +938,20 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			const file = historyFileFor(cwd);
 			const entries = activeEditor ? activeEditor.memory() : loadEntries(file);
 			const kept = entries.filter((e) => !e.includes(needle));
-			const removed = entries.length - kept.length;
+			let removed = entries.length - kept.length;
 			activeEditor?.setMemory(kept);
 			// Explicit destructive command: always hit disk, even when disabled,
 			// and honor isPersistable so / and ! inputs never leak.
 			persistMemory(file, kept);
+			// Global scope also keeps a per-project copy (the Ctrl+R "project"
+			// view reads it); scrub that file too so removal applies everywhere.
+			if (config.scope === "global") {
+				const pf = projectHistoryFileFor(cwd);
+				const proj = loadEntries(pf);
+				const projKept = proj.filter((e) => !e.includes(needle));
+				removed += proj.length - projKept.length;
+				persistMemory(pf, projKept);
+			}
 			ctx.ui.notify(
 				`Removed ${removed} entr${removed === 1 ? "y" : "ies"} from memory and disk.`,
 				"info",
@@ -1035,15 +1074,20 @@ export function setOption(key: string, value: string): { ok: boolean; message: s
 			config.scope = value;
 			saveConfig();
 			if (old !== value && config.enabled) {
-				// Snapshot the previous scope's history before switching files,
-				// then merge it into the new scope so nothing is lost.
-				const targetFile = historyFileFor(activeEditor?.cwd ?? "");
-				const previous = activeEditor ? activeEditor.memory() : loadEntries(targetFile);
-				activeEditor?.reloadFromDisk();
-				if (previous.length > 0) {
-					persistEntries(targetFile, previous);
-					activeEditor?.reloadFromDisk();
+				// project→global: fold the project's list into the shared file so
+				// native ↑/↓ keeps seeing it after the switch. global→project: just
+				// re-seed from this project's own file — carrying the cross-project
+				// list over would permanently mix other projects' prompts into the
+				// per-project file the Ctrl+R "project" view reads. Nothing is lost
+				// either way: entries stay in the files they were recorded in, and
+				// the "all" view still spans every file.
+				if (value === "global" && activeEditor) {
+					const previous = activeEditor.memory();
+					if (previous.length > 0) {
+						persistEntries(historyFileFor(activeEditor.cwd), previous);
+					}
 				}
+				activeEditor?.reloadFromDisk();
 			}
 			return { ok: true, message: `Set scope = ${value}` };
 		}
@@ -1234,6 +1278,7 @@ export const __internals = {
 	loadConfig,
 	normalizeConfig,
 	saveConfig,
+	projectHistoryFileFor,
 	tightenFile,
 	writeAtomic,
 	ensurePrivateDirs,

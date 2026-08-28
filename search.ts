@@ -247,7 +247,14 @@ class SearchDockComponent extends Container {
 		// or none, so the dock never jumps while typing.
 		const rows = Math.max(1, config.searchRows);
 		if (this.filtered.length === 0) {
-			lines.push(row(dim("(no matches)")));
+			// A genuinely empty project view is worth explaining: the per-project
+			// history only starts accruing from now on, and the rest of the old
+			// history is still reachable under the "all" scope.
+			const empty =
+				this.scope === "project" && this.entries.length === 0
+					? "(no history for this project yet — Tab to search all)"
+					: "(no matches)";
+			lines.push(row(dim(empty)));
 			for (let i = 1; i < rows; i++) lines.push(row(""));
 		} else {
 			const start = Math.max(

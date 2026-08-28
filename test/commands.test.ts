@@ -510,14 +510,25 @@ describe("handleSettingsCommand", () => {
 
 describe("getHistoryEntries", () => {
 	it("returns disk entries when there is no active editor", () => {
+		config.scope = "project";
 		saveEntries(historyFileFor("/test-cwd"), ["one", "two"]);
 		expect(getHistoryEntries("/test-cwd")).toEqual(["one", "two"]);
 	});
 
-	it("returns live editor memory when an editor is active", () => {
+	it("returns live editor memory when an editor is active (project scope)", () => {
+		config.scope = "project";
 		const editor = makeMockEditor("/test-cwd", ["mem-a", "mem-b"]);
 		__setActiveEditor(editor);
 		expect(getHistoryEntries("/test-cwd")).toEqual(["mem-a", "mem-b"]);
+	});
+
+	it("global scope: never returns the shared list even with an active editor", () => {
+		// Regression: with an editor seeded from the global file, the project
+		// view used to leak every project's prompts via live memory.
+		saveEntries(GLOBAL_HISTORY_FILE, ["cross-a"]);
+		const editor = makeMockEditor("/test-cwd", ["cross-a"]);
+		__setActiveEditor(editor);
+		expect(getHistoryEntries("/test-cwd")).toEqual([]);
 	});
 });
 
