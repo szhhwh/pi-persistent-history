@@ -248,7 +248,7 @@ class SearchDockComponent extends Container {
 		const rows = Math.max(1, config.searchRows);
 		if (this.filtered.length === 0) {
 			// A genuinely empty project view is worth explaining: the per-project
-			// history only starts accruing from now on, and the rest of the old
+			// history only starts accruing from now on, and other projects'
 			// history is still reachable under the "all" scope.
 			const empty =
 				this.scope === "project" && this.entries.length === 0

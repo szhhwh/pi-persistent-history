@@ -279,6 +279,8 @@ describe("PersistentHistoryEditor addToHistory store attribution", () => {
 		ed.setMemory(["foreign-a", "foreign-b"]);
 		ed.addToHistory("mine");
 		expect(loadProjectTexts(cwd)).toEqual(["mine"]);
+		// …and the global view also gets ONLY the new entry, never the list.
+		expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["mine"]);
 	});
 
 	it("honors isPersistable in both stores (recordCommands off)", () => {

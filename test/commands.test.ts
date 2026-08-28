@@ -338,21 +338,52 @@ describe("handleHistoryCommand", () => {
 			expect(ctx._notifications[0].level).toBe("warning");
 			expect(ctx._notifications[0].text).toContain("Usage: /history set");
 		});
+
+		it("re-seeds the live editor memory from the newly selected view on scope switch", async () => {
+			const ctx = makeCtx();
+			seed(projectFileFor(), ["p1"]);
+			seed(GLOBAL_HISTORY_FILE, ["g1"]);
+			const editor = makeMockEditor("/test-cwd", ["stale"]);
+			__setActiveEditor(editor);
+			await handleHistoryCommand("set scope global", ctx);
+			expect(config.scope).toBe("global");
+			// ↑/↓ re-seeds from the global view (storage itself is untouched).
+			expect(editor.memory()).toEqual(["g1"]);
+			await handleHistoryCommand("set scope project", ctx);
+			expect(editor.memory()).toEqual(["p1"]);
+		});
+
+		it("shrinks memory AND every on-disk store immediately on maxEntries change", async () => {
+			const ctx = makeCtx();
+			config.scope = "project";
+			seed(projectFileFor(), ["p1", "p2", "p3"]);
+			seed(GLOBAL_HISTORY_FILE, ["g1", "g2", "g3"]);
+			const editor = makeMockEditor("/test-cwd", ["m1", "m2", "m3"]);
+			__setActiveEditor(editor);
+			await handleHistoryCommand("set maxEntries 2", ctx);
+			expect(ctx._notifications[0].text).toBe("Set maxEntries = 2");
+			expect(editor.memory()).toEqual(["m1", "m2"]);
+			// both stores truncated to the 2 newest, newest first
+			expect(texts(projectFileFor())).toEqual(["p1", "p2"]);
+			expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["g1", "g2"]);
+		});
 	});
 
 	describe("remove", () => {
 		it("removes matching entries from disk and memory, notifying the count", async () => {
 			const ctx = makeCtx();
-			const file = historyFileFor("/test-cwd");
-			seed(file, ["apple", "banana", "cherry"]);
-			await handleHistoryCommand("remove an", ctx);
-			// "banana" contains "an"; "apple" and "cherry" do not
+			const pf = projectFileFor();
+			seed(pf, ["apple-p", "banana", "cherry"]);
+			seed(GLOBAL_HISTORY_FILE, ["apple-g", "banana", "date"]);
+			await handleHistoryCommand("remove apple", ctx);
 			expect(ctx._notifications[0].level).toBe("info");
-			expect(ctx._notifications[0].text).toContain("Removed 1 entr");
-			// disk reflects the removal — scrubbed in BOTH stores (the global view
-			// spans every project, so it is always scrubbed too)
-			expect(texts(file)).toEqual(["apple", "cherry"]);
-			expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["apple", "cherry"]);
+			// "apple-p" (project store) and "apple-g" (global view) are distinct
+			// removed texts; "banana" exists in both stores but counts once.
+			expect(ctx._notifications[0].text).toContain("Removed 2 entr");
+			// disk reflects the removal in BOTH stores (the per-project file and
+			// the global view are scrubbed independently)
+			expect(texts(pf)).toEqual(["banana", "cherry"]);
+			expect(texts(GLOBAL_HISTORY_FILE)).toEqual(["banana", "date"]);
 		});
 
 		it("works against the live editor memory when active", async () => {

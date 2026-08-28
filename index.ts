@@ -674,7 +674,14 @@ function rebuildGlobalIndex(): HistoryEntry[] {
 		rebuilt.push(e);
 		if (rebuilt.length >= config.maxEntries) break;
 	}
-	saveHistoryEntries(GLOBAL_HISTORY_FILE, rebuilt);
+	// Locked like every other write (no recursion risk: persistHistoryEntries
+	// holds this lock only around raw loadHistoryEntries reads, never a rebuild).
+	acquireHistoryLock(GLOBAL_HISTORY_FILE);
+	try {
+		saveHistoryEntries(GLOBAL_HISTORY_FILE, rebuilt);
+	} finally {
+		releaseHistoryLock(GLOBAL_HISTORY_FILE);
+	}
 	return rebuilt;
 }
 
@@ -786,6 +793,10 @@ class PersistentHistoryEditor extends CustomEditor {
 			// projects' prompts out of the per-project file in every view.
 			const now = Date.now();
 			persistHistoryEntries(projectHistoryFileFor(this.cwd), [{ t: trimmed, ts: now }]);
+			// Self-heal the derived view before merging into it: persistHistoryEntries
+			// reads the file raw, and merging into a missing/corrupt view would
+			// materialize an incomplete one and suppress the rebuild trigger forever.
+			loadGlobalIndex();
 			persistHistoryEntries(GLOBAL_HISTORY_FILE, [
 				{ t: trimmed, ts: now, p: projIdFor(this.cwd) },
 			]);
@@ -1042,11 +1053,22 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			// project). Explicit destructive command: always hit disk, even when
 			// disabled, via forceSaveHistoryEntries (isPersistable honored).
 			const removedTexts = new Set<string>();
-			for (const file of [projectHistoryFileFor(cwd), GLOBAL_HISTORY_FILE]) {
-				const entries = loadHistoryEntries(file);
-				for (const e of entries) if (e.t.includes(needle)) removedTexts.add(e.t);
-				forceSaveHistoryEntries(file, entries.filter((e) => !e.t.includes(needle)));
-			}
+			// The project file is read raw; the global view goes through
+			// loadGlobalIndex() so it self-heals before we filter and rewrite it —
+			// a raw read of a missing/corrupt view would materialize an incomplete
+			// one and suppress the rebuild trigger forever.
+			const projEntries = loadHistoryEntries(projectHistoryFileFor(cwd));
+			for (const e of projEntries) if (e.t.includes(needle)) removedTexts.add(e.t);
+			forceSaveHistoryEntries(
+				projectHistoryFileFor(cwd),
+				projEntries.filter((e) => !e.t.includes(needle)),
+			);
+			const globalEntries = loadGlobalIndex();
+			for (const e of globalEntries) if (e.t.includes(needle)) removedTexts.add(e.t);
+			forceSaveHistoryEntries(
+				GLOBAL_HISTORY_FILE,
+				globalEntries.filter((e) => !e.t.includes(needle)),
+			);
 			if (activeEditor) {
 				const mem = activeEditor.memory();
 				for (const e of mem) if (e.includes(needle)) removedTexts.add(e);
@@ -1097,7 +1119,8 @@ async function handleHistoryCommand(args: string, ctx: ExtensionCommandContext):
 			// history is untouched.
 			forceSaveHistoryEntries(projectHistoryFileFor(cwd), []);
 			const projId = projIdFor(cwd);
-			const index = loadHistoryEntries(GLOBAL_HISTORY_FILE);
+			// Self-heal the derived view before purging from it (see "remove").
+			const index = loadGlobalIndex();
 			const keptIndex = index.filter((e) => e.p !== projId);
 			// Explicit destructive command: always hit disk, even when disabled.
 			forceSaveHistoryEntries(GLOBAL_HISTORY_FILE, keptIndex);
