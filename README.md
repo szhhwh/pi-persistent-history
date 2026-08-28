@@ -13,13 +13,13 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 
 ## 存储位置
 
-| 内容 | 路径 | 权限 |
-|---|---|---|
-| 配置 | `~/.pi/agent/prompt-history.config.json` | 0600 |
-| 全局历史 | `~/.pi/agent/prompt-history.json` | 0600 |
-| 项目级历史 | `~/.pi/agent/prompt-histories/<dir>.json` | 0600 |
+| 内容 | 路径 |
+|---|---|
+| 配置 | `~/.pi/agent/prompt-history.config.json` |
+| 全局历史 | `~/.pi/agent/prompt-history.json` |
+| 项目级历史 | `~/.pi/agent/prompt-histories/<dir>.json` |
 
-文件创建为 0600（目录 0700），加载时还会把已有文件权限收紧。
+这些文件只有你自己能读写。
 
 ## 配置面板（GUI）
 
@@ -29,7 +29,7 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 /history-settings
 ```
 
-会打开一个**可操作的配置面板**（基于 pi 内置的 `SettingsList` 组件渲染的模态覆盖层）：
+会打开一个**可操作的配置面板**：
 
 - ↑/↓ 选择选项，`Enter` / `Space` 切换布尔/枚举值（`enabled`、`scope`、`dedup`、`recordCommands`）
 - 数值选项（`maxEntries`、`maxEntryChars`、`minLength`）按 `Enter` 打开单行文本输入框，`Esc` 取消，非法输入会回退并提示
@@ -76,10 +76,10 @@ pi install git:git@github.com:szhhwh/pi-persistent-history
 | dedup | consecutive \| always \| off | consecutive | 去重策略 |
 | recordCommands | on \| off | off | 是否持久化 `/` 和 `!` 输入 |
 | minLength | 非负整数 | 0 | 短于此长度的条目不记录 |
-| searchRows | 1–50 | 10 | 搜索 dock 固定显示的结果行数（固定高度，输入时布局不跳动） |
+| searchRows | 1–50 | 10 | 搜索结果显示的行数 |
 
 ## 持久化语义
 
-- 每次写入都会按当前配置重新过滤磁盘文件；收紧 `maxEntryChars` / `minLength` / `recordCommands` 会在下次提交时清除不匹配的条目。
-- 写入与磁盘文件做 merge（精确重复折叠、最新在前），因此另一个 pi 进程写入的条目不会被覆盖丢失。
-- 原子写入：先写随机名临时文件再 `rename`，避免半写与符号链接植入。
+- 每次写入都会按当前配置整理磁盘上的历史；调严选项后，不匹配的旧条目会在下次提交时被清除。
+- 多个 pi 实例同时使用不会互相覆盖或丢失历史。
+- 即使 pi 异常退出，下次使用也会自动恢复正常，无需你手动处理。
