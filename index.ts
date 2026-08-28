@@ -74,9 +74,10 @@ import { dirname, join } from "node:path";
 import { openConfigPanel } from "./panel";
 import { closeSearch, openSearch } from "./search";
 
-const CONFIG_FILE = join(homedir(), ".pi", "agent", "prompt-history.config.json");
-const GLOBAL_HISTORY_FILE = join(homedir(), ".pi", "agent", "prompt-history.json");
-const PROJECT_HISTORY_DIR = join(homedir(), ".pi", "agent", "prompt-histories");
+const HISTORY_HOME = process.env.PI_HISTORY_HOME ?? join(homedir(), ".pi", "agent");
+const CONFIG_FILE = join(HISTORY_HOME, "prompt-history.config.json");
+const GLOBAL_HISTORY_FILE = join(HISTORY_HOME, "prompt-history.json");
+const PROJECT_HISTORY_DIR = join(HISTORY_HOME, "prompt-histories");
 
 // ---------------------------------------------------------------------------
 // Config
@@ -511,6 +512,43 @@ function mergeEntries(live: string[], disk: string[]): string[] {
 	return merged;
 }
 
+/**
+ * Apply in-memory dedup + size cap for one new entry. Pure (no disk, no `this`)
+ * so it can be unit-tested directly; `addToHistory` splices the result back into
+ * the live array to keep native ↑/↓ browsing working.
+ *
+ * - `always`: remove any earlier copy, then prepend.
+ * - `consecutive`: prepend only if it differs from the current head.
+ * - `off`: always prepend.
+ * The list is capped to `maxEntries` (truncating the tail). Empty/whitespace
+ * `text` is a no-op returning the input unchanged.
+ */
+function recordEntry(
+	history: string[],
+	text: string,
+	dedup: Config["dedup"],
+	maxEntries: number,
+): string[] {
+	const trimmed = text.trim();
+	if (!trimmed) return history;
+	let h: string[];
+	if (dedup === "always") {
+		h = history.filter((e) => e !== trimmed);
+		h.unshift(trimmed);
+	} else if (dedup === "consecutive") {
+		if (history.length > 0 && history[0] === trimmed) {
+			h = history.slice(0, maxEntries);
+		} else {
+			h = [trimmed, ...history];
+		}
+	} else {
+		// off: keep all
+		h = [trimmed, ...history];
+	}
+	if (h.length > maxEntries) h.length = maxEntries;
+	return h;
+}
+
 function listHistoryFiles(): string[] {
 	const files: string[] = [];
 	try {
@@ -614,27 +652,12 @@ class PersistentHistoryEditor extends CustomEditor {
 		const trimmed = text.trim();
 		if (!trimmed) return;
 		const h = this.memory();
-
 		// In-memory recording always happens so native ↑/↓ keeps working;
 		// `enabled` only gates disk persistence (persistEntries early-returns),
-		// and must not change the dedup behavior chosen by the user.
-		if (config.dedup === "always") {
-			for (let i = h.length - 1; i >= 0; i--) {
-				if (h[i] === trimmed) h.splice(i, 1);
-			}
-			h.unshift(trimmed);
-		} else if (config.dedup === "consecutive") {
-			if (h[0] !== trimmed) h.unshift(trimmed);
-		} else {
-			// off: keep all
-			h.unshift(trimmed);
-		}
-
-		// Single cap. Non-persisted input must never shrink the persisted
-		// history below its size (the stock 100-entry cap applies to native
-		// seeding only).
-		if (h.length > config.maxEntries) h.length = config.maxEntries;
-
+		// and must not change the dedup behavior chosen by the user. The dedup +
+		// cap logic lives in the pure `recordEntry` helper (also unit-tested).
+		const next = recordEntry(h, trimmed, config.dedup, config.maxEntries);
+		h.splice(0, h.length, ...next);
 		if (this.seeded) persistEntries(historyFileFor(this.cwd), h);
 	}
 
@@ -1188,4 +1211,66 @@ export default function (pi: ExtensionAPI) {
 		description: "Open the persistent prompt history settings panel",
 		handler: handleSettingsCommand,
 	});
+}
+
+// ---------------------------------------------------------------------------
+// Test surface (NOT part of the public extension API)
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-export internal helpers for tests. index.ts is otherwise loaded only for
+ * its `default` export and the `/history` commands; this object keeps the real
+ * public surface small while letting the test suite reach pure helpers.
+ */
+export const __internals = {
+	DEFAULT_CONFIG,
+	HISTORY_HOME,
+	CONFIG_FILE,
+	GLOBAL_HISTORY_FILE,
+	PROJECT_HISTORY_DIR,
+	LOCK_RETRY_MAX,
+	LOCK_RETRY_BACKOFF_MS,
+	LOCK_STALE_AGE_MS,
+	loadConfig,
+	normalizeConfig,
+	saveConfig,
+	tightenFile,
+	writeAtomic,
+	ensurePrivateDirs,
+	sweepStaleTmp,
+	loadEntries,
+	saveEntries,
+	isPersistable,
+	persistMemory,
+	persistEntries,
+	mergeEntries,
+	recordEntry,
+	listHistoryFiles,
+	isPidAlive,
+	isLockStale,
+	lockFileFor,
+	acquireHistoryLock,
+	releaseHistoryLock,
+	reclaimStaleLock,
+	sweepStaleLocks,
+	parseBool,
+	argumentCompletions,
+	configValueAsString,
+	handleHistoryCommand,
+	handleSettingsCommand,
+	PersistentHistoryEditor,
+	SUBCOMMANDS,
+	CONFIG_KEYS,
+	HELP_TEXT,
+};
+
+/** Reset the in-memory config to defaults (tests only). Does not touch disk. */
+export function __resetConfig(): void {
+	Object.assign(config, DEFAULT_CONFIG);
+	configWarning = null;
+}
+
+/** Set/clear the live editor for tests only. */
+export function __setActiveEditor(e: PersistentHistoryEditor | null): void {
+	activeEditor = e;
 }
