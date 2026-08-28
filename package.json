@@ -6,6 +6,10 @@
     "pi-package"
   ],
   "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "test:watch": "bun test --watch"
+  },
   "files": [
     "index.ts",
     "panel.ts",

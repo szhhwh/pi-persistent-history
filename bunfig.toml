@@ -1,0 +1,4 @@
+[test]
+# Preload the test harness so PI_HISTORY_HOME points at an isolated temp dir
+# before any test file imports index.ts (which reads the env at module load).
+preload = ["./test/helpers.ts"]
